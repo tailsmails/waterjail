@@ -370,7 +370,7 @@ fn main() {
 		println(term.cyan('Generated hardened command:\n'))
 		
 		mut cmd_builder := []string{}
-		cmd_builder << './example'
+		cmd_builder << './waterjail'
 		cmd_builder << '-t allowlist'
 		for sys in unique_syscalls {
 			if sys == 'socket' {
