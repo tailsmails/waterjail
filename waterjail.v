@@ -34,6 +34,78 @@ fn clean_strace_args(args string) string {
 	return s.trim_space()
 }
 
+fn smart_split_args(args string) []string {
+	mut parts := []string{}
+	mut current := ''
+	mut in_quote := false
+	mut brace_depth := 0
+	mut bracket_depth := 0
+	for i := 0; i < args.len; i++ {
+		c := args[i]
+		if c == `"` {
+			in_quote = !in_quote
+		}
+		if !in_quote {
+			if c == `{` { brace_depth++ }
+			else if c == `}` { brace_depth-- }
+			else if c == `[` { bracket_depth++ }
+			else if c == `]` { bracket_depth-- }
+		}
+		if c == `,` && !in_quote && brace_depth == 0 && bracket_depth == 0 {
+			parts << current.trim_space()
+			current = ''
+		} else {
+			current += c.ascii_str()
+		}
+	}
+	if current.trim_space() != '' {
+		parts << current.trim_space()
+	}
+	return parts
+}
+
+fn is_pointer_address(s string) bool {
+	trimmed := s.trim_space()
+	if trimmed.starts_with('0x') || trimmed.starts_with('0X') {
+		if trimmed.len > 8 {
+			return true
+		}
+	}
+	return false
+}
+
+fn has_digits_or_letters(s string) bool {
+	for c in s {
+		if (c >= `0` && c <= `9`) || (c >= `a` && c <= `z`) || (c >= `A` && c <= `Z`) || c == `_` {
+			return true
+		}
+	}
+	return false
+}
+
+fn extract_return_value(line string) ?u64 {
+	idx := line.index(' = ') or { -1 }
+	if idx == -1 {
+		return none
+	}
+	right := line[idx + 3..].trim_space()
+	if right == '' {
+		return none
+	}
+	parts := right.split(' ')
+	first_part := parts[0].trim_space()
+	if first_part.starts_with('-') {
+		return none
+	}
+	if first_part.starts_with('0x') || first_part.starts_with('0X') {
+		return strconv.parse_uint(first_part[2..], 16, 64) or { return none }
+	}
+	if is_all_digits(first_part) {
+		return first_part.u64()
+	}
+	return none
+}
+
 fn try_parse_flags(expr string) ?u64 {
 	parts := expr.split('|')
 	mut total := u64(0)
@@ -189,7 +261,7 @@ fn parse_syscall_rule(input string) !ParsedSyscall {
 fn main() {
 	mut fp := flag.new_flag_parser(os.args)
 	fp.application('waterjail')
-	fp.version('0.0.1')
+	fp.version('0.0.2')
 	fp.description('A CLI tool to sandbox programs using custom syscall filters with argument evaluation.')
 	
 	fp.skip_executable()
@@ -222,7 +294,7 @@ fn main() {
 			exit(1)
 		}
 
-		temp_file := os.join_path(os.temp_dir(), 'vcomp_strace_${os.getpid()}.txt')
+		temp_file := os.join_path(os.temp_dir(), 'waterjail_strace_${os.getpid()}.txt')
 		
 		mut p := os.new_process(strace_path)
 		mut strace_args := ['-f', '-o', temp_file, target_cmd]
@@ -235,20 +307,22 @@ fn main() {
 		mut socket_domains := []u64{}
 		mut mprotect_unified_mask := u64(0)
 		mut mmap_unified_mask := u64(0)
-		mut unique_prctl_options := []u64{}
-		mut unique_ioctl_requests := []u64{}
-		mut unique_fcntl_cmds := []u64{}
-		mut unique_clone_flags := []u64{}
-
-		mut prctl_fallback := false
-		mut ioctl_fallback := false
-		mut fcntl_fallback := false
-		mut clone_fallback := false
+		
+		mut arg_profiles := map[string][]u64{}
+		mut syscall_fallbacks := map[string]bool{}
+		mut ephemeral_values := []u64{}
 
 		lines := os.read_lines(temp_file) or { []string{} }
 		for line in lines {
 			trimmed := line.trim_space()
 			
+			ret_val := extract_return_value(trimmed) or { u64(0) }
+			if ret_val > 2 {
+				if ret_val !in ephemeral_values {
+					ephemeral_values << ret_val
+				}
+			}
+
 			mut cmd_part := trimmed
 			idx_space := trimmed.index(' ') or { -1 }
 			if idx_space != -1 {
@@ -290,58 +364,6 @@ fn main() {
 					}
 					mmap_unified_mask |= prot_val
 				}
-			} else if cmd_part.starts_with('prctl(') {
-				args_str := cmd_part.all_after('prctl(').all_before(')')
-				clean_args := clean_strace_args(args_str)
-				parts := clean_args.split(',')
-				if parts.len >= 1 {
-					opt_val := try_parse_flags(parts[0]) or {
-						prctl_fallback = true
-						u64(0)
-					}
-					if !prctl_fallback && opt_val !in unique_prctl_options {
-						unique_prctl_options << opt_val
-					}
-				}
-			} else if cmd_part.starts_with('ioctl(') {
-				args_str := cmd_part.all_after('ioctl(').all_before(')')
-				clean_args := clean_strace_args(args_str)
-				parts := clean_args.split(',')
-				if parts.len >= 2 {
-					req_val := try_parse_flags(parts[1]) or {
-						ioctl_fallback = true
-						u64(0)
-					}
-					if !ioctl_fallback && req_val !in unique_ioctl_requests {
-						unique_ioctl_requests << req_val
-					}
-				}
-			} else if cmd_part.starts_with('fcntl(') {
-				args_str := cmd_part.all_after('fcntl(').all_before(')')
-				clean_args := clean_strace_args(args_str)
-				parts := clean_args.split(',')
-				if parts.len >= 2 {
-					cmd_val := try_parse_flags(parts[1]) or {
-						fcntl_fallback = true
-						u64(0)
-					}
-					if !fcntl_fallback && cmd_val !in unique_fcntl_cmds {
-						unique_fcntl_cmds << cmd_val
-					}
-				}
-			} else if cmd_part.starts_with('clone(') {
-				args_str := cmd_part.all_after('clone(').all_before(')')
-				clean_args := clean_strace_args(args_str)
-				parts := clean_args.split(',')
-				if parts.len >= 1 {
-					flg_val := try_parse_flags(parts[0]) or {
-						clone_fallback = true
-						u64(0)
-					}
-					if !clone_fallback && flg_val !in unique_clone_flags {
-						unique_clone_flags << flg_val
-					}
-				}
 			}
 
 			idx := trimmed.index('(') or { -1 }
@@ -355,6 +377,44 @@ fn main() {
 					}
 					if sys_name !in unique_syscalls {
 						unique_syscalls << sys_name
+					}
+
+					if sys_name != 'socket' && sys_name != 'mprotect' && sys_name != 'mmap' {
+						args_str := cmd_part.all_after('(').all_before(')')
+						clean_args := clean_strace_args(args_str)
+						parts := smart_split_args(clean_args)
+						for i, part in parts {
+							if i >= 6 { break }
+							trimmed_part := part.trim_space()
+							if trimmed_part == '' { continue }
+							if trimmed_part.starts_with('"') || trimmed_part.starts_with("'") { continue }
+							if trimmed_part.starts_with('{') || trimmed_part.starts_with('[') { continue }
+							if is_pointer_address(trimmed_part) { continue }
+
+							val := try_parse_flags(trimmed_part) or {
+								if has_digits_or_letters(trimmed_part) {
+									syscall_fallbacks[sys_name] = true
+								}
+								u64(0)
+							}
+
+							if val in ephemeral_values {
+								syscall_fallbacks[sys_name] = true
+								continue
+							}
+
+							if !syscall_fallbacks[sys_name] {
+								key := sys_name + '_' + i.str()
+								if key !in arg_profiles {
+									if key !in arg_profiles {
+										arg_profiles[key] = []u64{}
+									}
+								}
+								if val !in arg_profiles[key] {
+									arg_profiles[key] << val
+								}
+							}
+						}
 					}
 				}
 			}
@@ -387,24 +447,22 @@ fn main() {
 					cmd_builder << '-e "mmap:2&${inverse_mask}"'
 				}
 				cmd_builder << '-a mmap'
-			} else if sys == 'prctl' && !prctl_fallback && unique_prctl_options.len > 0 {
-				for opt in unique_prctl_options {
-					cmd_builder << '-a prctl:0==${opt}'
-				}
-			} else if sys == 'ioctl' && !ioctl_fallback && unique_ioctl_requests.len > 0 {
-				for req in unique_ioctl_requests {
-					cmd_builder << '-a ioctl:1==${req}'
-				}
-			} else if sys == 'fcntl' && !fcntl_fallback && unique_fcntl_cmds.len > 0 {
-				for cmd in unique_fcntl_cmds {
-					cmd_builder << '-a fcntl:1==${cmd}'
-				}
-			} else if sys == 'clone' && !clone_fallback && unique_clone_flags.len > 0 {
-				for flg in unique_clone_flags {
-					cmd_builder << '-a clone:0==${flg}'
-				}
-			} else {
+			} else if syscall_fallbacks[sys] {
 				cmd_builder << '-a ${sys}'
+			} else {
+				mut has_arg_filters := false
+				for i in 0 .. 6 {
+					key := sys + '_' + i.str()
+					if key in arg_profiles && arg_profiles[key].len > 0 && arg_profiles[key].len <= 5 {
+						for val in arg_profiles[key] {
+							cmd_builder << '-a ${sys}:${i}==${val}'
+						}
+						has_arg_filters = true
+					}
+				}
+				if !has_arg_filters {
+					cmd_builder << '-a ${sys}'
+				}
 			}
 		}
 		cmd_builder << '--'
@@ -439,40 +497,25 @@ fn main() {
 			}
 		}
 
-		if !prctl_fallback && unique_prctl_options.len > 0 {
-			println('\n[prctl] analysis:')
-			for opt in unique_prctl_options {
-				println('  - Allowed prctl option: ${opt}')
+		for sys in unique_syscalls {
+			if sys == 'socket' || sys == 'mprotect' || sys == 'mmap' {
+				continue
 			}
-		} else if prctl_fallback {
-			println(term.red('\n[prctl] analysis: Unresolved constants detected. Defaulting to safe fallback mode.'))
-		}
-
-		if !ioctl_fallback && unique_ioctl_requests.len > 0 {
-			println('\n[ioctl] analysis:')
-			for req in unique_ioctl_requests {
-				println('  - Allowed ioctl request: ${req}')
+			if syscall_fallbacks[sys] {
+				println(term.red('\n[${sys}] analysis: Unresolved constants, pointers, or ephemeral IDs detected. Defaulting to safe fallback.'))
+			} else {
+				mut printed_sys := false
+				for i in 0 .. 6 {
+					key := sys + '_' + i.str()
+					if key in arg_profiles && arg_profiles[key].len > 0 && arg_profiles[key].len <= 5 {
+						if !printed_sys {
+							println('\n[${sys}] analysis:')
+							printed_sys = true
+						}
+						println('  - Allowed argument ${i} values: ${arg_profiles[key]}')
+					}
+				}
 			}
-		} else if ioctl_fallback {
-			println(term.red('\n[ioctl] analysis: Unresolved constants detected. Defaulting to safe fallback mode.'))
-		}
-
-		if !fcntl_fallback && unique_fcntl_cmds.len > 0 {
-			println('\n[fcntl] analysis:')
-			for cmd in unique_fcntl_cmds {
-				println('  - Allowed fcntl cmd: ${cmd}')
-			}
-		} else if fcntl_fallback {
-			println(term.red('\n[fcntl] analysis: Unresolved constants detected. Defaulting to safe fallback mode.'))
-		}
-
-		if !clone_fallback && unique_clone_flags.len > 0 {
-			println('\n[clone] analysis:')
-			for flg in unique_clone_flags {
-				println('  - Allowed clone flags: ${flg}')
-			}
-		} else if clone_fallback {
-			println(term.red('\n[clone] analysis: Unresolved constants detected. Defaulting to safe fallback mode.'))
 		}
 		exit(0)
 	}
