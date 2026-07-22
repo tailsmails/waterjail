@@ -1,7 +1,5 @@
 # waterjail
 
----
-
 `waterjail` is a lightweight, surgical Seccomp-BPF dynamic sandboxing and analysis tool written in V. 
 
 ### ⚠️ Not a Firejail Replacement
