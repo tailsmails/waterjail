@@ -25,7 +25,6 @@ fn C._exit(status int)
 fn C.alarm(seconds u32) u32
 fn C.signal(signum int, handler voidptr) voidptr
 fn C.memcpy(dest voidptr, src voidptr, n usize) voidptr
-fn C.kill(pid int, sig int) int
 
 const ptrace_traceme = 0
 const ptrace_peekdata = 2
@@ -68,11 +67,6 @@ struct ParsedSyscall {
 	sys_name string
 	args     []vcomp.ArgRule
 	str_args []string
-}
-
-struct StrCheckData {
-	ptr  u64
-	orig string
 }
 
 fn read_string_from_ptrace(pid int, addr u64) string {
@@ -445,7 +439,6 @@ fn run_with_runtime_timer(
 	}
 
 	ptrace_str_rules := build_str_rules_map(allows)
-	mut str_check_map := map[int][]StrCheckData{}
 
 	has_static_rules := blocks.len > 0 || block_errnos.len > 0 || allows.len > 0
 
@@ -527,9 +520,6 @@ fn run_with_runtime_timer(
 	if runtime_time > 0 {
 		C.signal(sigalrm_const, sigalrm_handler)
 		C.alarm(u32(runtime_time))
-		println(term.cyan('[waterjail] Timer mode phase 1: allowing all for ${runtime_time}s'))
-	} else {
-		println(term.cyan('[waterjail] String filter mode active.'))
 	}
 
 	for {
@@ -549,12 +539,12 @@ fn run_with_runtime_timer(
 						for k, _ in explicit_block {
 							blocked_set[k] = true
 						}
-						println(term.yellow('[waterjail] Async Timer expired: blocking ${blocked_set.len} setup-only syscalls'))
+						println(term.yellow('[waterjail] Setup time expired: blocking ${blocked_set.len} setup-only syscalls'))
 					} else {
 						phase = 2
 						obs_start = now
 						C.alarm(u32(obs_time))
-						println(term.yellow('[waterjail] Async Timer expired: observing for ${obs_time}s...'))
+						println(term.yellow('[waterjail] Setup time expired: observing for ${obs_time}s...'))
 					}
 				} else if phase == 2 && (now - obs_start) >= f64(obs_time) {
 					phase = 3
@@ -581,7 +571,6 @@ fn run_with_runtime_timer(
 			}
 			is_enter_map.delete(current_pid)
 			blocked_this_map.delete(current_pid)
-			str_check_map.delete(current_pid)
 			continue
 		}
 		if (status & 0xff) != 0x7f {
@@ -590,7 +579,6 @@ fn run_with_runtime_timer(
 			}
 			is_enter_map.delete(current_pid)
 			blocked_this_map.delete(current_pid)
-			str_check_map.delete(current_pid)
 			continue
 		}
 
@@ -628,12 +616,12 @@ fn run_with_runtime_timer(
 						for k, _ in explicit_block {
 							blocked_set[k] = true
 						}
-						println(term.yellow('[waterjail] Sync Timer expired: blocking ${blocked_set.len} setup-only syscalls'))
+						println(term.yellow('[waterjail] Setup time expired: blocking ${blocked_set.len} setup-only syscalls'))
 					} else {
 						phase = 2
 						obs_start = now
 						C.alarm(u32(obs_time))
-						println(term.yellow('[waterjail] Sync Timer expired: observing for ${obs_time}s...'))
+						println(term.yellow('[waterjail] Setup time expired: observing for ${obs_time}s...'))
 					}
 				}
 
@@ -665,18 +653,15 @@ fn run_with_runtime_timer(
 			}
 
 			if do_str_check && sys_nr in ptrace_str_rules {
-				mut checks := []StrCheckData{}
 				mut all_match := true
 				for idx, allowed_strs in ptrace_str_rules[sys_nr] {
 					reg_offset := reg_offsets[idx]
 					arg_ptr := u64(C.ptrace(ptrace_peekuser, current_pid, reg_offset, 0))
 					actual_str := read_string_from_ptrace(current_pid, arg_ptr)
-					checks << StrCheckData{arg_ptr, actual_str}
 					if actual_str !in allowed_strs {
 						all_match = false
 					}
 				}
-				str_check_map[current_pid] = checks
 				if !all_match {
 					blocked_by_str = true
 				}
@@ -700,28 +685,6 @@ fn run_with_runtime_timer(
 
 			is_enter_map[current_pid] = false
 		} else {
-			if current_pid in str_check_map {
-				checks := str_check_map[current_pid]
-				mut toctou_detected := false
-				sys_ret := C.ptrace(ptrace_peekuser, current_pid, rax_offset, 0)
-				
-				if sys_ret >= 0 {
-					for chk in checks {
-						actual_str_exit := read_string_from_ptrace(current_pid, chk.ptr)
-						if actual_str_exit != chk.orig {
-							toctou_detected = true
-							break
-						}
-					}
-				}
-				str_check_map.delete(current_pid)
-				if toctou_detected {
-					println(term.red('[waterjail] TOCTOU attack detected. Killing process ${current_pid}.'))
-					C.kill(current_pid, 9)
-					continue
-				}
-			}
-
 			if blocked_this_map[current_pid] {
 				C.ptrace(ptrace_pokeuser, current_pid, rax_offset, -errno_code)
 			}
@@ -733,7 +696,7 @@ fn run_with_runtime_timer(
 fn main() {
 	mut fp := flag.new_flag_parser(os.args)
 	fp.application('waterjail')
-	fp.version('0.0.9')
+	fp.version('0.1.0')
 	fp.description('A CLI tool to sandbox programs using custom syscall filters with argument evaluation.')
 
 	fp.skip_executable()
