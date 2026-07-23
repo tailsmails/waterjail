@@ -9,6 +9,7 @@ import vcomp
 #include <sys/ptrace.h>
 #include <sys/wait.h>
 #include <sys/time.h>
+#include <signal.h>
 
 struct C.timeval {
 	tv_sec  i64
@@ -20,6 +21,8 @@ fn C.ptrace(request int, pid int, addr i64, data i64) i64
 fn C.waitpid(pid int, status &int, options int) int
 fn C.gettimeofday(tv &C.timeval, tz voidptr) int
 fn C._exit(status int)
+fn C.alarm(seconds u32) u32
+fn C.signal(signum int, handler voidptr) voidptr
 
 const ptrace_traceme = 0
 const ptrace_peekuser = 3
@@ -35,6 +38,11 @@ const ptrace_o_traceexec = 0x10
 const ptrace_wall = 0x40000000
 const orig_rax_offset = 120
 const rax_offset = 80
+const sigalrm_const = 14
+const eintr_const = 4
+
+fn sigalrm_handler(s os.Signal) {
+}
 
 struct ParsedSyscall {
 	sys_name string
@@ -419,6 +427,9 @@ fn run_with_runtime_timer(
 	mut current_pid := pid
 	mut pending_sig := 0
 
+	C.signal(sigalrm_const, sigalrm_handler)
+	C.alarm(u32(runtime_time))
+
 	println(term.cyan('[waterjail] Timer mode phase 1: allowing all for ${runtime_time}s'))
 
 	for {
@@ -426,12 +437,42 @@ fn run_with_runtime_timer(
 		pending_sig = 0
 
 		ret := C.waitpid(-1, &status, ptrace_wall)
+		
 		if ret <= 0 {
+			if C.errno == eintr_const {
+				C.gettimeofday(&tv, unsafe { nil })
+				now := f64(tv.tv_sec) + f64(tv.tv_usec) / 1e6
+				
+				if phase == 1 && (now - start_time) >= f64(runtime_time) {
+					if explicit_block.len > 0 {
+						phase = 3
+						for k, _ in explicit_block {
+							blocked_set[k] = true
+						}
+						println(term.yellow('[waterjail] Async Timer expired: blocking ${blocked_set.len} setup-only syscalls'))
+					} else {
+						phase = 2
+						obs_start = now
+						C.alarm(u32(obs_time))
+						println(term.yellow('[waterjail] Async Timer expired: observing for ${obs_time}s...'))
+					}
+				} else if phase == 2 && (now - obs_start) >= f64(obs_time) {
+					phase = 3
+					for nr, _ in phase1_syscalls {
+						if !(nr in phase2_syscalls) {
+							blocked_set[nr] = true
+						}
+					}
+					println(term.yellow('[waterjail] Observation done: blocking ${blocked_set.len} unused syscalls'))
+				}
+			}
+			
 			if C.errno == 10 {
 				break
 			}
 			continue
 		}
+		
 		current_pid = ret
 
 		if (status & 0x7f) == 0 {
@@ -484,11 +525,12 @@ fn run_with_runtime_timer(
 					for k, _ in explicit_block {
 						blocked_set[k] = true
 					}
-					println(term.yellow('[waterjail] Timer expired: blocking ${blocked_set.len} setup-only syscalls'))
+					println(term.yellow('[waterjail] Sync Timer expired: blocking ${blocked_set.len} setup-only syscalls'))
 				} else {
 					phase = 2
 					obs_start = now
-					println(term.yellow('[waterjail] Timer expired: observing for ${obs_time}s...'))
+					C.alarm(u32(obs_time))
+					println(term.yellow('[waterjail] Sync Timer expired: observing for ${obs_time}s...'))
 				}
 			}
 
