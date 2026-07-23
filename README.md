@@ -80,5 +80,40 @@ To block dangerous memory protections (like `PROT_EXEC` (4)) while allowing stan
 
 ---
 
+## What's New in v0.0.4: Dynamic Analysis & Time-Based Sandboxing
+
+Version 0.0.4 introduces a major shift from static rule definitions to dynamic, behavior-based syscall analysis. Instead of manually guessing which syscalls and arguments your application needs, `waterjail` can now observe the application and generate a hardened, time-aware sandbox automatically.
+
+### How It Works
+
+The new analyze mode (`-A`) operates in three distinct phases:
+
+1. **Observation (strace)**: `waterjail` runs the target application under `strace` to log every syscall, its arguments, and high-precision timestamps.
+2. **Dynamic Profiling**: It intelligently parses the logs to distinguish between stable arguments (e.g., `AF_INET`, flags) and dynamic ones (e.g., memory pointers, File Descriptors, PIDs). 
+   - **Bitmask Unification**: For memory management syscalls (`mmap`, `mprotect`), it unifies all observed protection bitmasks into a single allowed mask and generates a block rule for the inverse mask, strictly preventing unauthorized memory permissions (like simultaneous Write+Execute).
+   - **BPF Safety**: To prevent BPF compilation errors in the kernel, it automatically filters out large 64-bit negative values (such as `AT_FDCWD` converted to `u64`) and pointers.
+3. **Time-Aware Execution**: For complex applications (like web browsers or daemons), certain syscalls are only required during the initialization phase. The analyzer detects these and flags them as `--setup-only`.
+
+### Startup-Time vs. Runtime-Time
+
+Complex applications often need highly privileged syscalls (like `chroot`, `vfork`, or `fchown`) to set up their environment, but should never need them again once they are running. 
+
+- **`--setup-time <s>`**: Used during analysis mode (`-A`). It defines a threshold. Syscalls only observed within the first `<s>` seconds are categorized as setup-only.
+- **`--runtime-time <s>`**: Applied during actual execution. `waterjail` uses `ptrace` to monitor the process. For the first `<s>` seconds, `setup-only` syscalls are allowed. Once the timer expires, `waterjail` dynamically intercepts and blocks them at the kernel level by altering the process registers, returning `EPERM`.
+
+This hybrid approach (`seccomp` for static baseline + `ptrace` for time-based expiration) ensures that even if an attacker achieves Remote Code Execution (RCE) in your application after it has started, they cannot use critical syscalls to escalate privileges or spawn shellcodes.
+
+### Example Usage
+
+To analyze and generate a hardened command for a complex application like the Tor Browser:
+
+```bash
+./waterjail -A --setup-time 5 -- tor-browser
+```
+
+`waterjail` will output a ready-to-use, highly restrictive command featuring dynamic argument filtering, memory bitmasking, and time-based setup-only restrictions. You can then run the generated command to launch your application in a secure, hardened sandbox.
+
+---
+
 ## License
 ![License: GPL v3](https://img.shields.io/badge/License-MIT-blue.svg)
