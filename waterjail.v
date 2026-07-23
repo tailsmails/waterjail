@@ -9,6 +9,7 @@ import vcomp
 #include <sys/ptrace.h>
 #include <sys/wait.h>
 #include <sys/time.h>
+#include <sys/prctl.h>
 #include <signal.h>
 
 struct C.timeval {
@@ -43,6 +44,21 @@ const rax_offset = 80
 const reg_offsets = [112, 104, 96, 56, 72, 64]
 const sigalrm_const = 14
 const eintr_const = 4
+
+const output_buffer_args = {
+	'read': [1],
+	'pread64': [1],
+	'recvfrom': [1],
+	'getcwd': [0],
+	'readlink': [1],
+	'readlinkat': [2],
+	'fgetxattr': [2],
+	'lgetxattr': [2],
+	'getxattr': [2],
+	'listxattr': [1],
+	'llistxattr': [1],
+	'flistxattr': [1]
+}
 
 fn sigalrm_handler(s os.Signal) {
 }
@@ -86,7 +102,8 @@ fn build_str_rules_map(rules []string) map[int]map[int][]string {
 		if parsed.str_args.len == 0 {
 			continue
 		}
-		nr := vcomp.get_syscall_number(parsed.sys_name) or { continue }
+		sys_name := parsed.sys_name
+		nr := vcomp.get_syscall_number(sys_name) or { continue }
 		nr_i := int(nr)
 		if nr_i !in m {
 			m[nr_i] = map[int][]string{}
@@ -97,6 +114,11 @@ fn build_str_rules_map(rules []string) map[int]map[int][]string {
 				continue
 			}
 			idx := parts[0].trim_space().int()
+			
+			if sys_name in output_buffer_args && idx in output_buffer_args[sys_name] {
+				continue
+			}
+			
 			val := parts[1].trim_space().trim_left('"').trim_right('"')
 			if idx !in m[nr_i] {
 				m[nr_i][idx] = []string{}
@@ -634,7 +656,6 @@ fn run_with_runtime_timer(
 					actual_str := read_string_from_ptrace(current_pid, arg_ptr)
 					if actual_str !in allowed_strs {
 						all_match = false
-						break
 					}
 				}
 				if !all_match {
@@ -660,7 +681,7 @@ fn run_with_runtime_timer(
 fn main() {
 	mut fp := flag.new_flag_parser(os.args)
 	fp.application('waterjail')
-	fp.version('0.0.4')
+	fp.version('0.0.6')
 	fp.description('A CLI tool to sandbox programs using custom syscall filters with argument evaluation.')
 
 	fp.skip_executable()
@@ -689,6 +710,8 @@ fn main() {
 
 	target_cmd := remaining_args[0]
 	target_args := remaining_args[1..]
+
+	dangerous_syscalls := ['bpf', 'userfaultfd', 'perf_event_open', 'ptrace', 'keyctl', 'add_key', 'request_key', 'kexec_load', 'open_by_handle_at', 'mbind', 'set_mempolicy', 'migrate_pages', 'move_pages']
 
 	if analyze {
 		strace_path := os.find_abs_path_of_executable('strace') or { '' }
@@ -811,7 +834,7 @@ fn main() {
 				before_paren := trimmed[0..idx].trim_space()
 				sys_parts := before_paren.split(' ')
 				sys_name := sys_parts.last().trim_space()
-				if is_valid_syscall_name(sys_name) {
+				if is_valid_syscall_name(sys_name) && sys_name !in dangerous_syscalls {
 					_ := vcomp.get_syscall_number(sys_name) or { continue }
 					if sys_name !in unique_syscalls {
 						unique_syscalls << sys_name
@@ -860,6 +883,9 @@ fn main() {
 								continue
 							}
 							if trimmed_part.starts_with('"') || trimmed_part.starts_with("'") {
+								if sys_name in output_buffer_args && i in output_buffer_args[sys_name] {
+									continue
+								}
 								s := trimmed_part.trim_left('"\'').trim_right('"\'')
 								if s.len > 0 && s.len < 256 {
 									if arg_key !in str_arg_profiles {
