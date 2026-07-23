@@ -23,8 +23,10 @@ fn C.gettimeofday(tv &C.timeval, tz voidptr) int
 fn C._exit(status int)
 fn C.alarm(seconds u32) u32
 fn C.signal(signum int, handler voidptr) voidptr
+fn C.memcpy(dest voidptr, src voidptr, n usize) voidptr
 
 const ptrace_traceme = 0
+const ptrace_peekdata = 2
 const ptrace_peekuser = 3
 const ptrace_pokeuser = 5
 const ptrace_cont = 7
@@ -38,6 +40,7 @@ const ptrace_o_traceexec = 0x10
 const ptrace_wall = 0x40000000
 const orig_rax_offset = 120
 const rax_offset = 80
+const reg_offsets = [112, 104, 96, 56, 72, 64]
 const sigalrm_const = 14
 const eintr_const = 4
 
@@ -47,6 +50,61 @@ fn sigalrm_handler(s os.Signal) {
 struct ParsedSyscall {
 	sys_name string
 	args     []vcomp.ArgRule
+	str_args []string
+}
+
+fn read_string_from_ptrace(pid int, addr u64) string {
+	mut res := []u8{}
+	mut current_addr := addr
+	for {
+		word := u64(C.ptrace(ptrace_peekdata, pid, i64(current_addr), 0))
+		mut b := [8]u8{}
+		unsafe { C.memcpy(&b[0], &word, 8) }
+		mut found_null := false
+		for i in 0 .. 8 {
+			if b[i] == 0 {
+				found_null = true
+				break
+			}
+			res << b[i]
+		}
+		if found_null {
+			break
+		}
+		current_addr += 8
+		if res.len > 4096 {
+			break
+		}
+	}
+	return res.bytestr()
+}
+
+fn build_str_rules_map(rules []string) map[int]map[int][]string {
+	mut m := map[int]map[int][]string{}
+	for sys_str in rules {
+		parsed := parse_syscall_rule(sys_str) or { continue }
+		if parsed.str_args.len == 0 {
+			continue
+		}
+		nr := vcomp.get_syscall_number(parsed.sys_name) or { continue }
+		nr_i := int(nr)
+		if nr_i !in m {
+			m[nr_i] = map[int][]string{}
+		}
+		for s_rule in parsed.str_args {
+			parts := s_rule.split('==')
+			if parts.len != 2 {
+				continue
+			}
+			idx := parts[0].trim_space().int()
+			val := parts[1].trim_space().trim_left('"').trim_right('"')
+			if idx !in m[nr_i] {
+				m[nr_i][idx] = []string{}
+			}
+			m[nr_i][idx] << val
+		}
+	}
+	return m
 }
 
 fn is_all_digits(s string) bool {
@@ -279,6 +337,7 @@ fn parse_syscall_rule(input string) !ParsedSyscall {
 		return ParsedSyscall{
 			sys_name: input.trim_space()
 			args: []
+			str_args: []
 		}
 	}
 
@@ -288,22 +347,29 @@ fn parse_syscall_rule(input string) !ParsedSyscall {
 		return ParsedSyscall{
 			sys_name: sys_name
 			args: []
+			str_args: []
 		}
 	}
 
 	cond_parts := conds_str.split(',')
 	mut args := []vcomp.ArgRule{}
+	mut str_args := []string{}
 	for cond in cond_parts {
 		trimmed := cond.trim_space()
 		if trimmed != '' {
-			rule := parse_condition(trimmed)!
-			args << rule
+			if trimmed.contains('=="') {
+				str_args << trimmed
+			} else {
+				rule := parse_condition(trimmed)!
+				args << rule
+			}
 		}
 	}
 
 	return ParsedSyscall{
 		sys_name: sys_name
 		args: args
+		str_args: str_args
 	}
 }
 
@@ -349,6 +415,8 @@ fn run_with_runtime_timer(
 		}
 		explicit_block[int(nr)] = true
 	}
+
+	ptrace_str_rules := build_str_rules_map(allows)
 
 	has_static_rules := blocks.len > 0 || block_errnos.len > 0 || allows.len > 0
 
@@ -427,10 +495,13 @@ fn run_with_runtime_timer(
 	mut current_pid := pid
 	mut pending_sig := 0
 
-	C.signal(sigalrm_const, sigalrm_handler)
-	C.alarm(u32(runtime_time))
-
-	println(term.cyan('[waterjail] Timer mode phase 1: allowing all for ${runtime_time}s'))
+	if runtime_time > 0 {
+		C.signal(sigalrm_const, sigalrm_handler)
+		C.alarm(u32(runtime_time))
+		println(term.cyan('[waterjail] Timer mode phase 1: allowing all for ${runtime_time}s'))
+	} else {
+		println(term.cyan('[waterjail] String filter mode active.'))
+	}
 
 	for {
 		C.ptrace(ptrace_syscall_op, current_pid, 0, pending_sig)
@@ -439,7 +510,7 @@ fn run_with_runtime_timer(
 		ret := C.waitpid(-1, &status, ptrace_wall)
 		
 		if ret <= 0 {
-			if C.errno == eintr_const {
+			if C.errno == eintr_const && runtime_time > 0 {
 				C.gettimeofday(&tv, unsafe { nil })
 				now := f64(tv.tv_sec) + f64(tv.tv_usec) / 1e6
 				
@@ -519,39 +590,59 @@ fn run_with_runtime_timer(
 			now := f64(tv.tv_sec) + f64(tv.tv_usec) / 1e6
 			elapsed := now - start_time
 
-			if phase == 1 && elapsed >= f64(runtime_time) {
-				if explicit_block.len > 0 {
+			if runtime_time > 0 {
+				if phase == 1 && elapsed >= f64(runtime_time) {
+					if explicit_block.len > 0 {
+						phase = 3
+						for k, _ in explicit_block {
+							blocked_set[k] = true
+						}
+						println(term.yellow('[waterjail] Sync Timer expired: blocking ${blocked_set.len} setup-only syscalls'))
+					} else {
+						phase = 2
+						obs_start = now
+						C.alarm(u32(obs_time))
+						println(term.yellow('[waterjail] Sync Timer expired: observing for ${obs_time}s...'))
+					}
+				}
+
+				if phase == 2 && (now - obs_start) >= f64(obs_time) {
 					phase = 3
-					for k, _ in explicit_block {
-						blocked_set[k] = true
+					for nr, _ in phase1_syscalls {
+						if !(nr in phase2_syscalls) {
+							blocked_set[nr] = true
+						}
 					}
-					println(term.yellow('[waterjail] Sync Timer expired: blocking ${blocked_set.len} setup-only syscalls'))
-				} else {
-					phase = 2
-					obs_start = now
-					C.alarm(u32(obs_time))
-					println(term.yellow('[waterjail] Sync Timer expired: observing for ${obs_time}s...'))
+					println(term.yellow('[waterjail] Observation done: blocking ${blocked_set.len} unused syscalls'))
 				}
-			}
 
-			if phase == 2 && (now - obs_start) >= f64(obs_time) {
-				phase = 3
-				for nr, _ in phase1_syscalls {
-					if !(nr in phase2_syscalls) {
-						blocked_set[nr] = true
-					}
+				if phase == 1 {
+					phase1_syscalls[sys_nr] = true
+				} else if phase == 2 && sys_nr in phase1_syscalls {
+					phase2_syscalls[sys_nr] = true
 				}
-				println(term.yellow('[waterjail] Observation done: blocking ${blocked_set.len} unused syscalls'))
-			}
-
-			if phase == 1 {
-				phase1_syscalls[sys_nr] = true
-			} else if phase == 2 && sys_nr in phase1_syscalls {
-				phase2_syscalls[sys_nr] = true
 			}
 
 			blocked_this_map[current_pid] = false
-			if phase == 3 && sys_nr in blocked_set {
+			mut blocked_by_str := false
+			
+			if sys_nr in ptrace_str_rules {
+				mut all_match := true
+				for idx, allowed_strs in ptrace_str_rules[sys_nr] {
+					reg_offset := reg_offsets[idx]
+					arg_ptr := u64(C.ptrace(ptrace_peekuser, current_pid, reg_offset, 0))
+					actual_str := read_string_from_ptrace(current_pid, arg_ptr)
+					if actual_str !in allowed_strs {
+						all_match = false
+						break
+					}
+				}
+				if !all_match {
+					blocked_by_str = true
+				}
+			}
+
+			if (phase == 3 && sys_nr in blocked_set) || blocked_by_str {
 				C.ptrace(ptrace_pokeuser, current_pid, orig_rax_offset, -1)
 				blocked_this_map[current_pid] = true
 			}
@@ -625,6 +716,7 @@ fn main() {
 		mut mmap_unified_mask := u64(0)
 
 		mut arg_profiles := map[string][]u64{}
+		mut str_arg_profiles := map[string][]string{}
 		mut syscall_dynamic_args := map[string]bool{}
 		mut ephemeral_values := []u64{}
 
@@ -768,6 +860,15 @@ fn main() {
 								continue
 							}
 							if trimmed_part.starts_with('"') || trimmed_part.starts_with("'") {
+								s := trimmed_part.trim_left('"\'').trim_right('"\'')
+								if s.len > 0 && s.len < 256 {
+									if arg_key !in str_arg_profiles {
+										str_arg_profiles[arg_key] = []string{}
+									}
+									if s !in str_arg_profiles[arg_key] {
+										str_arg_profiles[arg_key] << s
+									}
+								}
 								continue
 							}
 							if trimmed_part.starts_with('{') || trimmed_part.starts_with('[') {
@@ -854,21 +955,32 @@ fn main() {
 				cmd_builder << '-a mmap'
 			} else {
 				mut arg_rules := []string{}
+				mut str_rules := []string{}
 				for i in 0 .. 6 {
 					key := sys + '_' + i.str()
 					if !syscall_dynamic_args[key] && key in arg_profiles && arg_profiles[key].len == 1 {
 						val := arg_profiles[key][0]
 						if val < 0x80000000 {
 							arg_rules << '${i}==${val}'
-						} else {
-							break
 						}
-					} else {
-						break
+					}
+					if key in str_arg_profiles && str_arg_profiles[key].len > 0 && str_arg_profiles[key].len <= 5 {
+						for s in str_arg_profiles[key] {
+							str_rules << '${i}=="${s}"'
+						}
 					}
 				}
-				if arg_rules.len > 0 {
-					cmd_builder << '-a ${sys}:${arg_rules.join(",")}'
+				mut all_rules := []string{}
+				all_rules << arg_rules
+				all_rules << str_rules
+				if all_rules.len > 0 {
+					rule_str := all_rules.join(",")
+					if str_rules.len > 0 {
+						mut escaped_rule_str := rule_str.replace("'", "'\\''")
+						cmd_builder << "-a '${sys}:${escaped_rule_str}'"
+					} else {
+						cmd_builder << "-a ${sys}:${rule_str}"
+					}
 				} else {
 					cmd_builder << '-a ${sys}'
 				}
@@ -952,6 +1064,16 @@ fn main() {
 					} else {
 						println(term.yellow(' - Arg ${i}: Multiple stable values detected (${arg_profiles[key].len}). Filter omitted.'))
 					}
+				} else if key in str_arg_profiles && str_arg_profiles[key].len > 0 {
+					if !printed_sys {
+						println('\n[${sys}] analysis:')
+						printed_sys = true
+					}
+					if str_arg_profiles[key].len <= 5 {
+						println(term.green(' - Allowed string argument ${i} values: ${str_arg_profiles[key]}'))
+					} else {
+						println(term.yellow(' - Arg ${i}: Too many unique strings detected (${str_arg_profiles[key].len}). Filter omitted.'))
+					}
 				}
 			}
 			if !printed_sys {
@@ -966,6 +1088,14 @@ fn main() {
 		eprintln('If you are using "v run", please use the long flag "--block-errno" instead of "-e",')
 		eprintln('or compile the binary first and run it directly to avoid flag interception.')
 		exit(1)
+	}
+
+	mut has_string_rules := false
+	for sys_str in allows {
+		if sys_str.contains('=="') {
+			has_string_rules = true
+			break
+		}
 	}
 
 	filter_type := match filter_type_str {
@@ -1010,7 +1140,7 @@ fn main() {
 		}
 	}
 
-	if runtime_time > 0 {
+	if runtime_time > 0 || has_string_rules {
 		run_with_runtime_timer(
 			target_cmd, target_args, runtime_time, setup_only, errno_code,
 			filter_type_str, blocks, block_errnos, allows,
