@@ -422,7 +422,6 @@ fn extract_strace_time(line string) ?f64 {
 	s := strconv.atof64(t_parts[2]) or { return none }
 	return h * 3600.0 + m * 60.0 + s
 }
-
 fn run_with_runtime_timer(
 	target_cmd string,
 	target_args []string,
@@ -445,6 +444,7 @@ fn run_with_runtime_timer(
 
 	ptrace_str_rules := build_str_rules_map(allows)
 	mut str_check_map := map[int][]StrCheckData{}
+	mut valid_syscall_rips := map[int]map[u64]bool{}
 
 	has_static_rules := blocks.len > 0 || block_errnos.len > 0 || allows.len > 0
 
@@ -612,6 +612,7 @@ fn run_with_runtime_timer(
 
 		if is_enter_map[current_pid] {
 			sys_nr := int(C.ptrace(ptrace_peekuser, current_pid, orig_rax_offset, 0))
+			syscall_rip := u64(C.ptrace(ptrace_peekuser, current_pid, 128, 0))
 
 			C.gettimeofday(&tv, unsafe { nil })
 			now := f64(tv.tv_sec) + f64(tv.tv_usec) / 1e6
@@ -643,16 +644,22 @@ fn run_with_runtime_timer(
 					println(term.yellow('[waterjail] Observation done: blocking ${blocked_set.len} unused syscalls'))
 				}
 
-				if phase == 1 {
+				if phase == 1 || phase == 2 {
 					phase1_syscalls[sys_nr] = true
-				} else if phase == 2 && sys_nr in phase1_syscalls {
-					phase2_syscalls[sys_nr] = true
+					if phase == 2 && sys_nr in phase1_syscalls {
+						phase2_syscalls[sys_nr] = true
+					}
+					if sys_nr !in valid_syscall_rips {
+						valid_syscall_rips[sys_nr] = map[u64]bool{}
+					}
+					valid_syscall_rips[sys_nr][syscall_rip] = true
 				}
 			}
 
 			blocked_this_map[current_pid] = false
 			mut blocked_by_str := false
 			mut do_str_check := false
+			mut blocked_by_rop := false
 
 			if runtime_time > 0 && phase == 3 {
 				do_str_check = true
@@ -678,9 +685,19 @@ fn run_with_runtime_timer(
 				}
 			}
 
+			if runtime_time > 0 && phase == 3 {
+				if sys_nr in valid_syscall_rips {
+					if !(syscall_rip in valid_syscall_rips[sys_nr]) {
+						blocked_by_rop = true
+					}
+				} else {
+					blocked_by_rop = true
+				}
+			}
+
 			mut should_block := false
 			if runtime_time > 0 && phase == 3 {
-				if sys_nr in blocked_set || blocked_by_str {
+				if sys_nr in blocked_set || blocked_by_str || blocked_by_rop {
 					should_block = true
 				}
 			} else if runtime_time == 0 {
