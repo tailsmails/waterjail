@@ -29,7 +29,7 @@ fn C.memcpy(dest voidptr, src voidptr, n usize) voidptr
 const ptrace_traceme = 0
 const ptrace_peekdata = 2
 const ptrace_peekuser = 3
-const ptrace_pokeuser = 5
+const ptrace_pokeuser = 6
 const ptrace_cont = 7
 const ptrace_syscall_op = 24
 const ptrace_setoptions_op = 0x4200
@@ -39,11 +39,35 @@ const ptrace_o_tracevfork = 0x04
 const ptrace_o_traceclone = 0x08
 const ptrace_o_traceexec = 0x10
 const ptrace_wall = 0x40000000
-const orig_rax_offset = 120
-const rax_offset = 80
-const reg_offsets = [112, 104, 96, 56, 72, 64]
 const sigalrm_const = 14
 const eintr_const = 4
+
+$if x64 {
+	const orig_rax_offset = 120
+	const rax_offset = 80
+	const rip_offset = 128
+	const reg_offsets = [112, 104, 96, 56, 72, 64]
+} $else $if x32 {
+	const orig_rax_offset = 36
+	const rax_offset = 24
+	const rip_offset = 40
+	const reg_offsets = [0, 4, 8, 12, 16, 20]
+} $else $if arm64 {
+	const orig_rax_offset = 64
+	const rax_offset = 0
+	const rip_offset = 256
+	const reg_offsets = [0, 8, 16, 24, 32, 40]
+} $else $if arm32 {
+	const orig_rax_offset = 68
+	const rax_offset = 0
+	const rip_offset = 60
+	const reg_offsets = [0, 4, 8, 12, 16, 20]
+} $else {
+	const orig_rax_offset = 120
+	const rax_offset = 80
+	const rip_offset = 128
+	const reg_offsets = [112, 104, 96, 56, 72, 64]
+}
 
 const output_buffer_args = {
 	'read': [1],
@@ -422,6 +446,7 @@ fn extract_strace_time(line string) ?f64 {
 	s := strconv.atof64(t_parts[2]) or { return none }
 	return h * 3600.0 + m * 60.0 + s
 }
+
 fn run_with_runtime_timer(
 	target_cmd string,
 	target_args []string,
@@ -612,7 +637,7 @@ fn run_with_runtime_timer(
 
 		if is_enter_map[current_pid] {
 			sys_nr := int(C.ptrace(ptrace_peekuser, current_pid, orig_rax_offset, 0))
-			syscall_rip := u64(C.ptrace(ptrace_peekuser, current_pid, 128, 0))
+			syscall_rip := u64(C.ptrace(ptrace_peekuser, current_pid, rip_offset, 0))
 
 			C.gettimeofday(&tv, unsafe { nil })
 			now := f64(tv.tv_sec) + f64(tv.tv_usec) / 1e6
@@ -744,7 +769,7 @@ fn run_with_runtime_timer(
 fn main() {
 	mut fp := flag.new_flag_parser(os.args)
 	fp.application('waterjail')
-	fp.version('0.1.1')
+	fp.version('0.1.3')
 	fp.description('A CLI tool to sandbox programs using custom syscall filters with argument evaluation.')
 
 	fp.skip_executable()
