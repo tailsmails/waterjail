@@ -91,7 +91,7 @@ The new analyze mode (`-A`) operates in three distinct phases:
 1. **Observation (strace)**: `waterjail` runs the target application under `strace` to log every syscall, its arguments, and high-precision timestamps.
 2. **Dynamic Profiling**: It intelligently parses the logs to distinguish between stable arguments (e.g., `AF_INET`, flags) and dynamic ones (e.g., memory pointers, File Descriptors, PIDs). 
    - **Bitmask Unification**: For memory management syscalls (`mmap`, `mprotect`), it unifies all observed protection bitmasks into a single allowed mask and generates a block rule for the inverse mask, strictly preventing unauthorized memory permissions (like simultaneous Write+Execute).
-   - **BPF Safety**: To prevent BPF compilation errors in the kernel, it automatically filters out large 64-bit negative values (such as `AT_FDCWD` converted to `u64`) and pointers.
+   - **BPF Safety**: To prevent BPF compilation errors in the kernel, it automatically filters out large 64-bit negative values (such as `AT_FDCWD` converted to `u64`) and pointers, and merges multi-argument rules into single comma-separated conditions to avoid BPF filter conflicts.
 3. **Time-Aware Execution**: For complex applications (like web browsers or daemons), certain syscalls are only required during the initialization phase. The analyzer detects these and flags them as `--setup-only`.
 
 ### Startup-Time vs. Runtime-Time
@@ -102,6 +102,14 @@ Complex applications often need highly privileged syscalls (like `chroot`, `vfor
 - **`--runtime-time <s>`**: Applied during actual execution. `waterjail` uses `ptrace` to monitor the process. For the first `<s>` seconds, `setup-only` syscalls are allowed. Once the timer expires, `waterjail` dynamically intercepts and blocks them at the kernel level by altering the process registers, returning `EPERM`.
 
 This hybrid approach (`seccomp` for static baseline + `ptrace` for time-based expiration) ensures that even if an attacker achieves Remote Code Execution (RCE) in your application after it has started, they cannot use critical syscalls to escalate privileges or spawn shellcodes.
+
+### Race Condition Mitigation
+
+`seccomp` operates entirely in kernel space and is immune to race conditions. However, `ptrace` operates in userspace, which introduces synchronization challenges.
+
+To prevent a malicious process from keeping the tracer idle (e.g., waiting on network I/O) indefinitely to bypass the timer, `waterjail` v0.0.4 utilizes kernel-level `SIGALRM` via the `alarm()` syscall. This ensures that the phase transition from "allowed" to "blocked" occurs exactly on time, regardless of the target process's activity. 
+
+*Note on TOCTOU*: While `SIGALRM` fixes the idle-bypass vulnerability, a microscopic Time-of-Check to Time-of-Use (TOCTOU) race condition inherently exists in userspace `ptrace` interception when a syscall is executed exactly as the timer expires. For 99% of use cases (preventing accidental post-startup privilege escalations), this is highly effective. If dealing with actively hostile, timing-exploit-aware targets, consider this a known architectural limitation of `ptrace`.
 
 ### Example Usage
 
