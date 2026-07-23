@@ -80,46 +80,42 @@ To block dangerous memory protections (like `PROT_EXEC` (4)) while allowing stan
 
 ---
 
-## What's New in v0.0.4: Dynamic Analysis & Time-Based Sandboxing
+## What's New in v0.0.4: Dynamic Analysis, Time-Based Sandboxing & String Filtering
 
-Version 0.0.4 introduces a major shift from static rule definitions to dynamic, behavior-based syscall analysis. Instead of manually guessing which syscalls and arguments your application needs, `waterjail` can now observe the application and generate a hardened, time-aware sandbox automatically.
+Version 0.0.4 introduces dynamic behavior-based syscall analysis, time-aware execution, and the ability to filter syscalls based on string arguments (like file paths or magic bytes) using `ptrace`.
 
-### How It Works
+### Dynamic String Argument Filtering
 
-The new analyze mode (`-A`) operates in three distinct phases:
+Historically, `seccomp` BPF filters could only inspect numeric syscall arguments. A syscall like `openat` takes a pointer to a string (the file path), which BPF cannot dereference. 
 
-1. **Observation (strace)**: `waterjail` runs the target application under `strace` to log every syscall, its arguments, and high-precision timestamps.
-2. **Dynamic Profiling**: It intelligently parses the logs to distinguish between stable arguments (e.g., `AF_INET`, flags) and dynamic ones (e.g., memory pointers, File Descriptors, PIDs). 
-   - **Bitmask Unification**: For memory management syscalls (`mmap`, `mprotect`), it unifies all observed protection bitmasks into a single allowed mask and generates a block rule for the inverse mask, strictly preventing unauthorized memory permissions (like simultaneous Write+Execute).
-   - **BPF Safety**: To prevent BPF compilation errors in the kernel, it automatically filters out large 64-bit negative values (such as `AT_FDCWD` converted to `u64`) and pointers, and merges multi-argument rules into single comma-separated conditions to avoid BPF filter conflicts.
-3. **Time-Aware Execution**: For complex applications (like web browsers or daemons), certain syscalls are only required during the initialization phase. The analyzer detects these and flags them as `--setup-only`.
+Version 0.0.4 bridges this gap using a hybrid `seccomp` + `ptrace` architecture:
+1. **Analysis Mode**: When running with `-A`, `waterjail` detects string arguments in syscalls (e.g., `openat(AT_FDCWD, "/etc/hosts", ...)`). If the application uses a small set of stable strings, it generates rules like `-a openat:1=="/etc/hosts"`. It also captures binary data (like ELF headers in `read`) and formats them safely.
+2. **Execution Mode**: Because `seccomp` cannot evaluate string rules, `waterjail` automatically falls back to `ptrace` interception when string rules are present. When the target process calls a syscall, `waterjail` intercepts it, reads the process memory at the argument pointer using `PTRACE_PEEKDATA`, extracts the string, and validates it against the allowlist. If it doesn't match, the syscall is blocked and `EPERM` is returned.
+3. **Shell Safety**: Generated commands automatically wrap string-based rules in escaped single-quotes to prevent Bash history expansion or local variable injection issues (e.g., handling `#!/usr/bin/env bash` safely).
+
+### How Dynamic Analysis Works
+
+The analyze mode (`-A`) operates in three distinct phases:
+1. **Observation (strace)**: Logs every syscall, arguments, and timestamps.
+2. **Dynamic Profiling**: Distinguishes between stable arguments (e.g., flags) and dynamic ones (e.g., FDs, memory pointers). For `mmap`/`mprotect`, it unifies protection bitmasks and blocks the inverse to prevent simultaneous Write+Execute permissions. It also filters out large 64-bit negative values (like `AT_FDCWD` as `u64`) to prevent kernel BPF compilation errors.
+3. **Time-Aware Execution**: Complex apps often need privileged syscalls (`chroot`, `vfork`) only during setup. The analyzer detects these and flags them as `--setup-only`.
 
 ### Startup-Time vs. Runtime-Time
 
-Complex applications often need highly privileged syscalls (like `chroot`, `vfork`, or `fchown`) to set up their environment, but should never need them again once they are running. 
+- **`--setup-time <s>`**: Used in analysis mode to categorize syscalls only observed in the first `<s>` seconds as setup-only.
+- **`--runtime-time <s>`**: Uses `ptrace` to allow setup-only syscalls for `<s>` seconds, then dynamically blocks them by altering process registers.
 
-- **`--setup-time <s>`**: Used during analysis mode (`-A`). It defines a threshold. Syscalls only observed within the first `<s>` seconds are categorized as setup-only.
-- **`--runtime-time <s>`**: Applied during actual execution. `waterjail` uses `ptrace` to monitor the process. For the first `<s>` seconds, `setup-only` syscalls are allowed. Once the timer expires, `waterjail` dynamically intercepts and blocks them at the kernel level by altering the process registers, returning `EPERM`.
-
-This hybrid approach (`seccomp` for static baseline + `ptrace` for time-based expiration) ensures that even if an attacker achieves Remote Code Execution (RCE) in your application after it has started, they cannot use critical syscalls to escalate privileges or spawn shellcodes.
-
-### Race Condition Mitigation
-
-`seccomp` operates entirely in kernel space and is immune to race conditions. However, `ptrace` operates in userspace, which introduces synchronization challenges.
-
-To prevent a malicious process from keeping the tracer idle (e.g., waiting on network I/O) indefinitely to bypass the timer, `waterjail` v0.0.4 utilizes kernel-level `SIGALRM` via the `alarm()` syscall. This ensures that the phase transition from "allowed" to "blocked" occurs exactly on time, regardless of the target process's activity. 
-
-*Note on TOCTOU*: While `SIGALRM` fixes the idle-bypass vulnerability, a microscopic Time-of-Check to Time-of-Use (TOCTOU) race condition inherently exists in userspace `ptrace` interception when a syscall is executed exactly as the timer expires. For 99% of use cases (preventing accidental post-startup privilege escalations), this is highly effective. If dealing with actively hostile, timing-exploit-aware targets, consider this a known architectural limitation of `ptrace`.
+To prevent a malicious process from keeping the tracer idle to bypass the timer, v0.0.4 utilizes kernel-level `SIGALRM` via `alarm()`, ensuring phase transitions occur exactly on time regardless of process activity. A microscopic TOCTOU race condition inherently exists in userspace `ptrace` interception, which is a known architectural limitation.
 
 ### Example Usage
 
-To analyze and generate a hardened command for a complex application like the Tor Browser:
+Analyze and generate a hardened command (supporting numeric, bitmask, and string rules):
 
 ```bash
 ./waterjail -A --setup-time 5 -- tor-browser
 ```
 
-`waterjail` will output a ready-to-use, highly restrictive command featuring dynamic argument filtering, memory bitmasking, and time-based setup-only restrictions. You can then run the generated command to launch your application in a secure, hardened sandbox.
+Run the generated command to launch the application in a secure, dynamically enforced sandbox combining the speed of `seccomp` BPF and the deep inspection capabilities of `ptrace`.
 
 ---
 
