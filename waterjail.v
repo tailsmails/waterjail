@@ -178,9 +178,13 @@ fn try_parse_flags(expr string) ?u64 {
 			'TIOCGWINSZ' { u64(0x5413) }
 			'TIOCGPGRP' { u64(0x540f) }
 			'TIOCSPGRP' { u64(0x5410) }
+			'AT_FDCWD' { u64(0xFFFFFFFFFFFFFF9C) }
+			'MAP_FAILED' { u64(0xFFFFFFFFFFFFFFFF) }
 			else {
 				if trimmed.starts_with('0x') || trimmed.starts_with('0X') {
 					strconv.parse_uint(trimmed[2..], 16, 64) or { return none }
+				} else if trimmed.starts_with('0') && trimmed.len > 1 {
+					strconv.parse_uint(trimmed[1..], 8, 64) or { return none }
 				} else if is_all_digits(trimmed) {
 					trimmed.u64()
 				} else {
@@ -207,17 +211,6 @@ fn is_valid_syscall_name(s string) bool {
 		}
 	}
 	return true
-}
-
-fn is_safe_arg_to_filter(sys_name string, arg_idx int) bool {
-	mut safe := false
-	match sys_name {
-		'socket' { safe = arg_idx <= 2 }
-		'prctl' { safe = arg_idx == 0 }
-		'setsockopt' { safe = arg_idx == 1 || arg_idx == 2 }
-		else { safe = false }
-	}
-	return safe
 }
 
 fn parse_condition(cond string) !vcomp.ArgRule {
@@ -259,6 +252,8 @@ fn parse_condition(cond string) !vcomp.ArgRule {
 		val = strconv.parse_uint(val_str[2..], 16, 64) or {
 			return error('failed to parse hex value: ' + val_str)
 		}
+	} else if val_str.starts_with('-') {
+		val = u64(val_str.i64())
 	} else {
 		val = val_str.u64()
 	}
@@ -532,7 +527,7 @@ fn run_with_runtime_timer(
 fn main() {
 	mut fp := flag.new_flag_parser(os.args)
 	fp.application('waterjail')
-	fp.version('0.0.3')
+	fp.version('0.0.4')
 	fp.description('A CLI tool to sandbox programs using custom syscall filters with argument evaluation.')
 
 	fp.skip_executable()
@@ -588,8 +583,11 @@ fn main() {
 		mut mmap_unified_mask := u64(0)
 
 		mut arg_profiles := map[string][]u64{}
-		mut syscall_fallbacks := map[string]bool{}
+		mut syscall_dynamic_args := map[string]bool{}
 		mut ephemeral_values := []u64{}
+
+		mut syscall_min_args := map[string]int{}
+		mut syscall_max_args := map[string]int{}
 
 		mut setup_phase_syscalls := map[string]bool{}
 		mut runtime_phase_syscalls := map[string]bool{}
@@ -685,6 +683,11 @@ fn main() {
 						unique_syscalls << sys_name
 					}
 
+					if sys_name !in syscall_min_args {
+						syscall_min_args[sys_name] = 999
+						syscall_max_args[sys_name] = 0
+					}
+
 					if current_phase == 1 {
 						setup_phase_syscalls[sys_name] = true
 					} else if current_phase == 2 {
@@ -695,10 +698,29 @@ fn main() {
 						args_str := cmd_part.all_after('(').all_before(')')
 						clean_args := clean_strace_args(args_str)
 						parts := smart_split_args(clean_args)
+						
+						if parts.len < syscall_min_args[sys_name] {
+							syscall_min_args[sys_name] = parts.len
+						}
+						if parts.len > syscall_max_args[sys_name] {
+							syscall_max_args[sys_name] = parts.len
+						}
+
 						for i, part in parts {
 							if i >= 6 {
 								break
 							}
+
+							arg_key := sys_name + '_' + i.str()
+
+							if syscall_min_args[sys_name] != syscall_max_args[sys_name] && i >= syscall_min_args[sys_name] {
+								syscall_dynamic_args[arg_key] = true
+								if arg_key in arg_profiles {
+									arg_profiles.delete(arg_key)
+								}
+								continue
+							}
+
 							trimmed_part := part.trim_space()
 							if trimmed_part == '' {
 								continue
@@ -713,26 +735,33 @@ fn main() {
 								continue
 							}
 
-							val := try_parse_flags(trimmed_part) or {
-								if has_digits_or_letters(trimmed_part) {
-									syscall_fallbacks[sys_name] = true
-								}
-								u64(0)
-							}
-
-							if val in ephemeral_values {
-								syscall_fallbacks[sys_name] = true
+							if syscall_dynamic_args[arg_key] {
 								continue
 							}
 
-							if !syscall_fallbacks[sys_name] && is_safe_arg_to_filter(sys_name, i) {
-								key := sys_name + '_' + i.str()
-								if key !in arg_profiles {
-									arg_profiles[key] = []u64{}
+							val := try_parse_flags(trimmed_part) or {
+								if has_digits_or_letters(trimmed_part) {
+									syscall_dynamic_args[arg_key] = true
+									if arg_key in arg_profiles {
+										arg_profiles.delete(arg_key)
+									}
 								}
-								if val !in arg_profiles[key] {
-									arg_profiles[key] << val
+								continue
+							}
+
+							if val in ephemeral_values {
+								syscall_dynamic_args[arg_key] = true
+								if arg_key in arg_profiles {
+									arg_profiles.delete(arg_key)
 								}
+								continue
+							}
+
+							if arg_key !in arg_profiles {
+								arg_profiles[arg_key] = []u64{}
+							}
+							if val !in arg_profiles[arg_key] {
+								arg_profiles[arg_key] << val
 							}
 						}
 					}
@@ -781,20 +810,24 @@ fn main() {
 					cmd_builder << '-e "mmap:2&${inverse_mask}"'
 				}
 				cmd_builder << '-a mmap'
-			} else if syscall_fallbacks[sys] {
-				cmd_builder << '-a ${sys}'
 			} else {
-				mut has_arg_filters := false
+				mut arg_rules := []string{}
 				for i in 0 .. 6 {
 					key := sys + '_' + i.str()
-					if key in arg_profiles && arg_profiles[key].len > 0 && arg_profiles[key].len <= 5 {
-						for val in arg_profiles[key] {
-							cmd_builder << '-a ${sys}:${i}==${val}'
+					if !syscall_dynamic_args[key] && key in arg_profiles && arg_profiles[key].len == 1 {
+						val := arg_profiles[key][0]
+						if val < 0x80000000 {
+							arg_rules << '${i}==${val}'
+						} else {
+							break
 						}
-						has_arg_filters = true
+					} else {
+						break
 					}
 				}
-				if !has_arg_filters {
+				if arg_rules.len > 0 {
+					cmd_builder << '-a ${sys}:${arg_rules.join(",")}'
+				} else {
 					cmd_builder << '-a ${sys}'
 				}
 			}
@@ -853,20 +886,34 @@ fn main() {
 			if sys == 'mprotect' || sys == 'mmap' {
 				continue
 			}
-			if syscall_fallbacks[sys] {
-				println(term.red('\n[${sys}] analysis: Unresolved constants, pointers, or ephemeral IDs detected. Defaulting to safe fallback.'))
-			} else {
-				mut printed_sys := false
-				for i in 0 .. 6 {
-					key := sys + '_' + i.str()
-					if key in arg_profiles && arg_profiles[key].len > 0 && arg_profiles[key].len <= 5 {
-						if !printed_sys {
-							println('\n[${sys}] analysis:')
-							printed_sys = true
+			mut printed_sys := false
+			for i in 0 .. 6 {
+				key := sys + '_' + i.str()
+				if syscall_dynamic_args[key] {
+					if !printed_sys {
+						println('\n[${sys}] analysis:')
+						printed_sys = true
+					}
+					println(term.red(' - Arg ${i}: Dynamic/unstable value detected. Filter omitted.'))
+				} else if key in arg_profiles && arg_profiles[key].len > 0 {
+					if !printed_sys {
+						println('\n[${sys}] analysis:')
+						printed_sys = true
+					}
+					if arg_profiles[key].len == 1 {
+						val := arg_profiles[key][0]
+						if val >= 0x80000000 {
+							println(term.yellow(' - Arg ${i}: Large 64-bit value detected (${val}). Filter omitted for BPF safety.'))
+						} else {
+							println(' - Allowed argument ${i} values: ${arg_profiles[key]}')
 						}
-						println(' - Allowed argument ${i} values: ${arg_profiles[key]}')
+					} else {
+						println(term.yellow(' - Arg ${i}: Multiple stable values detected (${arg_profiles[key].len}). Filter omitted.'))
 					}
 				}
+			}
+			if !printed_sys {
+				println('\n[${sys}] analysis: No stable arguments to filter. Allowed unconditionally.')
 			}
 		}
 		exit(0)
