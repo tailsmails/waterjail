@@ -96,7 +96,7 @@ const output_buffer_args = {
 	'flistxattr': [1]
 }
 
-const path_taking_syscalls = ['open', 'openat', 'stat', 'lstat', 'newfstatat', 'statx', 'chmod', 'fchmodat', 'chown', 'fchownat', 'lchown', 'unlink', 'unlinkat', 'rmdir', 'mkdir', 'mkdirat', 'rename', 'renameat', 'renameat2', 'symlink', 'symlinkat', 'link', 'linkat', 'readlink', 'readlinkat', 'chdir', 'chroot', 'truncate']
+const path_taking_syscalls = ['open', 'openat', 'stat', 'lstat', 'newfstatat', 'statx', 'chmod', 'fchmodat', 'chown', 'fchownat', 'lchown', 'unlink', 'unlinkat', 'rmdir', 'mkdir', 'mkdirat', 'rename', 'renameat', 'renameat2', 'link', 'linkat', 'readlink', 'readlinkat', 'chdir', 'chroot', 'truncate']
 
 fn sigalrm_handler(s os.Signal) {
 }
