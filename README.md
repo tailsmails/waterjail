@@ -149,7 +149,7 @@ To ensure shell and parser safety:
 
 - **`ptrace` State Desync Fix**: Fixed a critical issue where a `SIGALRM` interrupt during `waitpid` could desynchronize the `ptrace` syscall tracking state. The tracer now correctly preserves the entry/exit state across signal interrupts.
 - **Multi-threaded Entry/Exit Tracking**: Fixed a race condition where `SIGSTOP` in running threads could cause the entry/exit state map to become corrupted, leading to invalid register reads (e.g., reading `sys_nr=-1`) and immediate process termination.
-- **ROP Check Adjustments**: The Return-Oriented Programming (ROP) mitigation that blocked syscalls originating from unobserved RIP addresses has been temporarily disabled. It caused false positives in modern multi-threaded runtimes (like `glibc`) where the same syscall is legitimately called from multiple dynamically loaded code paths.
+- **ROP Check Adjustments**: The Return-Oriented Programming (ROP) mitigation that blocked syscalls originating from unobserved RIP addresses has been removed. It caused false positives in modern multi-threaded runtimes (like `glibc`) where the same syscall is legitimately called from multiple dynamically loaded code paths.
 
 ### Script Generation
 
