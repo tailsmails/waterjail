@@ -96,6 +96,8 @@ const output_buffer_args = {
 	'flistxattr': [1]
 }
 
+const path_taking_syscalls = ['open', 'openat', 'stat', 'lstat', 'newfstatat', 'statx', 'chmod', 'fchmodat', 'chown', 'fchownat', 'lchown', 'unlink', 'unlinkat', 'rmdir', 'mkdir', 'mkdirat', 'rename', 'renameat', 'renameat2', 'symlink', 'symlinkat', 'link', 'linkat', 'readlink', 'readlinkat', 'chdir', 'chroot', 'truncate']
+
 fn sigalrm_handler(s os.Signal) {
 }
 
@@ -1088,6 +1090,11 @@ fn main() {
 								if sys_name in output_buffer_args && i in output_buffer_args[sys_name] {
 									continue
 								}
+								
+								if sys_name !in path_taking_syscalls {
+									continue
+								}
+
 								s := trimmed_part.trim_left('"\'').trim_right('"\'')
 								if s.len > 0 && s.len < 256 && !s.contains(',') && !s.contains('"') && !s.contains('\\') {
 									if arg_key !in str_arg_profiles {
