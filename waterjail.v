@@ -27,6 +27,7 @@ fn C.alarm(seconds u32) u32
 fn C.signal(signum int, handler voidptr) voidptr
 fn C.memcpy(dest voidptr, src voidptr, n usize) voidptr
 fn C.__errno_location() &int
+fn C.prctl(option int, arg2 int, arg3 int, arg4 int, arg5 int) int
 
 fn get_errno() int {
 	return unsafe { *C.__errno_location() }
@@ -46,8 +47,11 @@ const ptrace_o_tracevfork = 0x04
 const ptrace_o_traceclone = 0x08
 const ptrace_o_traceexec = 0x10
 const ptrace_wall = 0x40000000
+const ptrace_o_exitkill = 0x00100000
 const sigalrm_const = 14
 const eintr_const = 4
+const pr_set_pdeathsig = 1
+const sigkill_const = 9
 
 $if x64 {
 	const orig_rax_offset = 120
@@ -582,6 +586,7 @@ fn run_with_runtime_timer(
 
 	if pid == 0 {
 		C.ptrace(ptrace_traceme, 0, 0, 0)
+		C.prctl(pr_set_pdeathsig, sigkill_const, 0, 0, 0)
 
 		if has_static_rules {
 			filter_type := match filter_type_str {
@@ -626,7 +631,7 @@ fn run_with_runtime_timer(
 	mut status := 0
 	C.waitpid(pid, &status, 0)
 
-	ptrace_opts := ptrace_o_tracesysgood | ptrace_o_tracefork | ptrace_o_tracevfork | ptrace_o_traceclone | ptrace_o_traceexec
+	ptrace_opts := ptrace_o_tracesysgood | ptrace_o_tracefork | ptrace_o_tracevfork | ptrace_o_traceclone | ptrace_o_traceexec | ptrace_o_exitkill
 	C.ptrace(ptrace_setoptions_op, pid, 0, ptrace_opts)
 
 	mut is_enter_map := map[int]bool{}
