@@ -804,9 +804,7 @@ fn run_with_runtime_timer(
 			}
 
 			if should_block {
-				if os.getenv('WATERJAIL_DEBUG').len > 0 {
-					eprintln('[ptrace] Blocked sys=${sys_nr} pid=${current_pid} (by_str=${blocked_by_str}, by_rop=${blocked_by_rop}, in_set=${sys_nr in blocked_set})')
-				}
+				eprintln('[ptrace] Blocked sys=${sys_nr} pid=${current_pid} (by_str=${blocked_by_str}, by_rop=${blocked_by_rop}, in_set=${sys_nr in blocked_set})')
 				C.ptrace(ptrace_pokeuser, current_pid, orig_rax_offset, -1)
 				blocked_this_map[current_pid] = true
 			}
@@ -830,9 +828,7 @@ fn run_with_runtime_timer(
 				}
 				str_check_map.delete(current_pid)
 				if toctou_detected {
-					if os.getenv('WATERJAIL_DEBUG').len > 0 {
-						eprintln('[ptrace] TOCTOU blocked pid=${current_pid}')
-					}
+					eprintln('[ptrace] TOCTOU blocked pid=${current_pid}')
 					C.ptrace(ptrace_pokeuser, current_pid, rax_offset, -errno_code)
 				}
 			}
