@@ -530,7 +530,6 @@ fn run_with_runtime_timer(
 
 	ptrace_str_rules := build_str_rules_map(allows)
 	mut str_check_map := map[int][]StrCheckData{}
-	mut valid_syscall_rips := map[int]map[u64]bool{}
 
 	has_static_rules := blocks.len > 0 || block_errnos.len > 0 || allows.len > 0
 
@@ -591,8 +590,6 @@ fn run_with_runtime_timer(
 
 	mut is_enter_map := map[int]bool{}
 	mut blocked_this_map := map[int]bool{}
-	mut phase1_syscalls := map[int]bool{}
-	mut phase2_syscalls := map[int]bool{}
 	mut blocked_set := map[int]bool{}
 
 	is_enter_map[pid] = true
@@ -644,11 +641,6 @@ fn run_with_runtime_timer(
 					}
 				} else if phase == 2 && (now - obs_start) >= f64(obs_time) {
 					phase = 3
-					for nr, _ in phase1_syscalls {
-						if !(nr in phase2_syscalls) {
-							blocked_set[nr] = true
-						}
-					}
 				}
 			}
 			
@@ -704,7 +696,6 @@ fn run_with_runtime_timer(
 
 		if is_enter_map[current_pid] {
 			sys_nr := int(C.ptrace(ptrace_peekuser, current_pid, orig_rax_offset, 0))
-			syscall_rip := u64(C.ptrace(ptrace_peekuser, current_pid, rip_offset, 0))
 
 			C.gettimeofday(&tv, unsafe { nil })
 			now := f64(tv.tv_sec) + f64(tv.tv_usec) / 1e6
@@ -726,29 +717,12 @@ fn run_with_runtime_timer(
 
 				if phase == 2 && (now - obs_start) >= f64(obs_time) {
 					phase = 3
-					for nr, _ in phase1_syscalls {
-						if !(nr in phase2_syscalls) {
-							blocked_set[nr] = true
-						}
-					}
-				}
-
-				if phase == 1 || phase == 2 {
-					phase1_syscalls[sys_nr] = true
-					if phase == 2 && sys_nr in phase1_syscalls {
-						phase2_syscalls[sys_nr] = true
-					}
-					if sys_nr !in valid_syscall_rips {
-						valid_syscall_rips[sys_nr] = map[u64]bool{}
-					}
-					valid_syscall_rips[sys_nr][syscall_rip] = true
 				}
 			}
 
 			blocked_this_map[current_pid] = false
 			mut blocked_by_str := false
 			mut do_str_check := false
-			mut blocked_by_rop := false
 
 			if runtime_time > 0 && phase == 3 {
 				do_str_check = true
@@ -794,7 +768,7 @@ fn run_with_runtime_timer(
 
 			mut should_block := false
 			if runtime_time > 0 && phase == 3 {
-				if sys_nr in blocked_set || blocked_by_str || blocked_by_rop {
+				if sys_nr in blocked_set || blocked_by_str {
 					should_block = true
 				}
 			} else if runtime_time == 0 {
@@ -804,7 +778,7 @@ fn run_with_runtime_timer(
 			}
 
 			if should_block {
-				eprintln('[ptrace] Blocked sys=${sys_nr} pid=${current_pid} (by_str=${blocked_by_str}, by_rop=${blocked_by_rop}, in_set=${sys_nr in blocked_set})')
+				eprintln('[ptrace] Blocked sys=${sys_nr} pid=${current_pid} (by_str=${blocked_by_str}, in_set=${sys_nr in blocked_set})')
 				C.ptrace(ptrace_pokeuser, current_pid, orig_rax_offset, -1)
 				blocked_this_map[current_pid] = true
 			}
