@@ -34,6 +34,7 @@ fn get_errno() int {
 
 const ptrace_traceme = 0
 const ptrace_peekdata = 2
+const ptrace_pokedata = 5
 const ptrace_peekuser = 3
 const ptrace_pokeuser = 6
 const ptrace_cont = 7
@@ -53,26 +54,31 @@ $if x64 {
 	const rax_offset = 80
 	const rip_offset = 128
 	const reg_offsets = [112, 104, 96, 56, 72, 64]
+	const syscall_size = 2
 } $else $if x32 {
 	const orig_rax_offset = 36
 	const rax_offset = 24
 	const rip_offset = 40
 	const reg_offsets = [0, 4, 8, 12, 16, 20]
+	const syscall_size = 2
 } $else $if arm64 {
 	const orig_rax_offset = 64
 	const rax_offset = 0
 	const rip_offset = 256
 	const reg_offsets = [0, 8, 16, 24, 32, 40]
+	const syscall_size = 4
 } $else $if arm32 {
 	const orig_rax_offset = 68
 	const rax_offset = 0
 	const rip_offset = 60
 	const reg_offsets = [0, 4, 8, 12, 16, 20]
+	const syscall_size = 4
 } $else {
 	const orig_rax_offset = 120
 	const rax_offset = 80
 	const rip_offset = 128
 	const reg_offsets = [112, 104, 96, 56, 72, 64]
+	const syscall_size = 2
 }
 
 const output_buffer_args = {
@@ -100,8 +106,11 @@ struct ParsedSyscall {
 }
 
 struct StrCheckData {
-	ptr  u64
-	orig string
+	ptr      u64
+	orig     string
+	sys_nr   int
+	buf_ptr  u64
+	buf_len  int
 }
 
 fn find_common_prefix(strings []string) string {
@@ -165,6 +174,36 @@ fn read_string_from_ptrace(pid int, addr u64) string {
 		}
 	}
 	return res.bytestr()
+}
+
+fn inject_close(pid int, fd int) {
+	saved_orig_rax := C.ptrace(ptrace_peekuser, pid, orig_rax_offset, 0)
+	saved_arg0 := C.ptrace(ptrace_peekuser, pid, reg_offsets[0], 0)
+	saved_rip := C.ptrace(ptrace_peekuser, pid, rip_offset, 0)
+
+	C.ptrace(ptrace_pokeuser, pid, orig_rax_offset, 3)
+	C.ptrace(ptrace_pokeuser, pid, reg_offsets[0], i64(fd))
+	C.ptrace(ptrace_pokeuser, pid, rip_offset, saved_rip - syscall_size)
+
+	mut status := 0
+	C.ptrace(ptrace_syscall_op, pid, 0, 0)
+	C.waitpid(pid, &status, 0)
+	C.ptrace(ptrace_syscall_op, pid, 0, 0)
+	C.waitpid(pid, &status, 0)
+
+	C.ptrace(ptrace_pokeuser, pid, orig_rax_offset, saved_orig_rax)
+	C.ptrace(ptrace_pokeuser, pid, reg_offsets[0], saved_arg0)
+	C.ptrace(ptrace_pokeuser, pid, rip_offset, saved_rip)
+}
+
+fn zero_tracee_memory(pid int, addr u64, len int) {
+	if addr == 0 || len == 0 {
+		return
+	}
+	mut zero_word := u64(0)
+	for i := 0; i < len; i += 8 {
+		C.ptrace(ptrace_pokedata, pid, i64(addr + u64(i)), i64(zero_word))
+	}
 }
 
 fn build_str_rules_map(rules []string) map[int]map[int][]string {
@@ -742,7 +781,21 @@ fn run_with_runtime_timer(
 					}
 					
 					actual_str := read_string_from_ptrace(current_pid, arg_ptr)
-					checks << StrCheckData{arg_ptr, actual_str}
+					
+					mut buf_ptr := u64(0)
+					mut buf_len := 0
+					if sys_nr == 89 {
+						buf_ptr = u64(C.ptrace(ptrace_peekuser, current_pid, reg_offsets[1], 0))
+						buf_len = int(C.ptrace(ptrace_peekuser, current_pid, reg_offsets[2], 0))
+					} else if sys_nr == 106 || sys_nr == 107 {
+						buf_ptr = u64(C.ptrace(ptrace_peekuser, current_pid, reg_offsets[1], 0))
+						buf_len = 256
+					} else if sys_nr == 262 {
+						buf_ptr = u64(C.ptrace(ptrace_peekuser, current_pid, reg_offsets[2], 0))
+						buf_len = 256
+					}
+					
+					checks << StrCheckData{arg_ptr, actual_str, sys_nr, buf_ptr, buf_len}
 					
 					mut matched_any := false
 					for allowed in allowed_strs {
@@ -796,13 +849,25 @@ fn run_with_runtime_timer(
 						actual_str_exit := read_string_from_ptrace(current_pid, chk.ptr)
 						if actual_str_exit != chk.orig {
 							toctou_detected = true
+							
+							if chk.sys_nr == 257 || chk.sys_nr == 2 {
+								inject_close(current_pid, int(sys_ret))
+							} else if chk.sys_nr == 89 {
+								mut actual_len := int(sys_ret)
+								if actual_len > chk.buf_len {
+									actual_len = chk.buf_len
+								}
+								zero_tracee_memory(current_pid, chk.buf_ptr, actual_len)
+							} else if chk.sys_nr == 106 || chk.sys_nr == 107 || chk.sys_nr == 262 {
+								zero_tracee_memory(current_pid, chk.buf_ptr, 256)
+							}
 							break
 						}
 					}
 				}
 				str_check_map.delete(current_pid)
 				if toctou_detected {
-					eprintln('[ptrace] TOCTOU blocked pid=${current_pid}')
+					eprintln('[ptrace] TOCTOU detected and neutralized! pid=${current_pid}')
 					C.ptrace(ptrace_pokeuser, current_pid, rax_offset, -errno_code)
 				}
 			}
