@@ -119,5 +119,59 @@ Run the generated command to launch the application in a secure, dynamically enf
 
 ---
 
+## What's New in v0.1.3: Smart I/O Profiling, Wildcard Strings & Stability Fixes
+
+Version 0.1.3 brings significant stability improvements for complex, multi-threaded applications (like web browsers), introduces intelligent wildcard generation for string rules, and refines the dynamic analysis to avoid sandboxing dead-ends.
+
+### Smart Dynamic Profiling & I/O Tracking
+
+Previous versions could mistakenly categorize event-driven I/O syscalls (like `accept4`, `bind`, `listen`, or `read` on specific sockets) as "setup-only" if they weren't observed during the initial runtime observation phase. This caused crashes when the application later needed them to handle new network traffic.
+
+Version 0.1.3 introduces **FD Tracking**:
+1. The analyzer tracks file descriptors returned by syscalls (e.g., sockets, pipes, event files).
+2. Any syscall that operates on these tracked FDs is dynamically identified as an I/O operation.
+3. I/O operations are excluded from the `--setup-only` list, ensuring event-driven applications can handle future network or IPC traffic without crashing.
+
+Additionally, syscalls that query core system information using a single pointer argument (like `uname`) are no longer marked as `setup-only`, preventing crashes from unpredictable standard library queries (e.g., DNS resolution). The internal kernel mechanism `restart_syscall` is also explicitly exempted from setup-only blocking.
+
+### Wildcard String Filtering & Parser Hardening
+
+When multiple similar strings are observed for the same argument (e.g., `prctl` setting memory names like `"jemalloc"` and `"jemalloc-decommitted"`), the analyzer now:
+1. Finds the common prefix among the observed strings.
+2. Generates a single wildcard rule (e.g., `-a 'prctl:4=="jemalloc*"'`).
+3. The runtime `ptrace` interceptor now supports suffix wildcard matching, allowing related dynamic strings to pass the filter without disabling the rule entirely.
+
+To ensure shell and parser safety:
+- Strings containing complex characters (commas, quotes, backslashes) are automatically filtered out during rule generation.
+- The rule parser has been hardened to correctly ignore commas enclosed within quotes, fixing a critical bug where file paths containing commas would break execution.
+
+### Stability Fixes for Multi-threaded & Event-Driven Apps
+
+- **`ptrace` State Desync Fix**: Fixed a critical issue where a `SIGALRM` interrupt during `waitpid` could desynchronize the `ptrace` syscall tracking state. The tracer now correctly preserves the entry/exit state across signal interrupts.
+- **Multi-threaded Entry/Exit Tracking**: Fixed a race condition where `SIGSTOP` in running threads could cause the entry/exit state map to become corrupted, leading to invalid register reads (e.g., reading `sys_nr=-1`) and immediate process termination.
+- **ROP Check Adjustments**: The Return-Oriented Programming (ROP) mitigation that blocked syscalls originating from unobserved RIP addresses has been temporarily disabled. It caused false positives in modern multi-threaded runtimes (like `glibc`) where the same syscall is legitimately called from multiple dynamically loaded code paths.
+
+### Script Generation
+
+Instead of flooding the terminal with a massive, hard-to-copy command, the analyzer now automatically writes the generated hardened command to an executable shell script named `<target>.sh`. 
+
+```bash
+./waterjail -A --setup-time 5 -- tor-browser
+# Output: Generated hardened script: start-tor-browser.sh
+./start-tor-browser.sh
+```
+
+### Example Usage
+
+Analyze a complex browser, automatically generating safe I/O, numeric, and wildcard string rules:
+
+```bash
+./waterjail -A --setup-time 5 -- tor-browser
+```
+
+Run the generated script to enforce the sandbox. The hybrid `seccomp` + `ptrace` engine will enforce time-based setup restrictions, string allowlists, and dynamic I/O allowances without crashing the application.
+
+---
+
 ## License
 ![License: GPL v3](https://img.shields.io/badge/License-MIT-blue.svg)
