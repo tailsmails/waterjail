@@ -58,30 +58,35 @@ $if x64 {
 	const orig_rax_offset = 120
 	const rax_offset = 80
 	const rip_offset = 128
+	const rsp_offset = 152
 	const reg_offsets = [112, 104, 96, 56, 72, 64]
 	const syscall_size = 2
 } $else $if x32 {
 	const orig_rax_offset = 36
 	const rax_offset = 24
 	const rip_offset = 40
+	const rsp_offset = 48
 	const reg_offsets = [0, 4, 8, 12, 16, 20]
 	const syscall_size = 2
 } $else $if arm64 {
 	const orig_rax_offset = 64
 	const rax_offset = 0
 	const rip_offset = 256
+	const rsp_offset = 264
 	const reg_offsets = [0, 8, 16, 24, 32, 40]
 	const syscall_size = 4
 } $else $if arm32 {
 	const orig_rax_offset = 68
 	const rax_offset = 0
 	const rip_offset = 60
+	const rsp_offset = 56
 	const reg_offsets = [0, 4, 8, 12, 16, 20]
 	const syscall_size = 4
 } $else {
 	const orig_rax_offset = 120
 	const rax_offset = 80
 	const rip_offset = 128
+	const rsp_offset = 152
 	const reg_offsets = [112, 104, 96, 56, 72, 64]
 	const syscall_size = 2
 }
@@ -123,6 +128,18 @@ struct StrCheckData {
 struct DynamicRule {
 	str_args map[int][]regex.RE
 	u64_args []vcomp.ArgRule
+}
+
+struct RedirectedState {
+	orig_rsp u64
+	orig_reg_vals map[int]u64
+}
+
+fn resolve_syscall_num(sys_name string) !int {
+	nr := vcomp.get_syscall_number(sys_name) or {
+		return error('unknown syscall name: ${sys_name}')
+	}
+	return int(nr)
 }
 
 fn glob_to_regex(glob string) string {
@@ -214,11 +231,33 @@ fn read_string_from_ptrace(pid int, addr u64) string {
 	return res.bytestr()
 }
 
+fn write_string_to_ptrace(pid int, addr u64, s string) {
+	mut current_addr := addr
+	mut i := 0
+	for i < s.len {
+		mut word := u64(0)
+		mut chunk_len := s.len - i
+		if chunk_len > 8 {
+			chunk_len = 8
+		}
+		unsafe {
+			C.memcpy(&word, s.str + i, chunk_len)
+		}
+		C.ptrace(ptrace_pokedata, pid, i64(current_addr), i64(word))
+		current_addr += 8
+		i += 8
+	}
+	if s.len % 8 == 0 {
+		C.ptrace(ptrace_pokedata, pid, i64(current_addr), 0)
+	}
+}
+
 fn inject_close(pid int, fd int) {
+	close_sys_nr := resolve_syscall_num('close') or { 3 }
 	saved_orig_rax := C.ptrace(ptrace_peekuser, pid, orig_rax_offset, 0)
 	saved_arg0 := C.ptrace(ptrace_peekuser, pid, reg_offsets[0], 0)
 	saved_rip := C.ptrace(ptrace_peekuser, pid, rip_offset, 0)
-	C.ptrace(ptrace_pokeuser, pid, orig_rax_offset, 3)
+	C.ptrace(ptrace_pokeuser, pid, orig_rax_offset, i64(close_sys_nr))
 	C.ptrace(ptrace_pokeuser, pid, reg_offsets[0], i64(fd))
 	C.ptrace(ptrace_pokeuser, pid, rip_offset, saved_rip - syscall_size)
 	mut status := 0
@@ -235,9 +274,17 @@ fn zero_tracee_memory(pid int, addr u64, len int) {
 	if addr == 0 || len == 0 {
 		return
 	}
-	mut zero_word := u64(0)
-	for i := 0; i < len; i += 8 {
-		C.ptrace(ptrace_pokedata, pid, i64(addr + u64(i)), i64(zero_word))
+	mut i := 0
+	for i <= len - 8 {
+		C.ptrace(ptrace_pokedata, pid, i64(addr + u64(i)), 0)
+		i += 8
+	}
+	if i < len {
+		remaining := len - i
+		mut word := u64(C.ptrace(ptrace_peekdata, pid, i64(addr + u64(i)), 0))
+		mask := ~((u64(1) << (remaining * 8)) - 1)
+		word &= mask
+		C.ptrace(ptrace_pokedata, pid, i64(addr + u64(i)), i64(word))
 	}
 }
 
@@ -246,7 +293,7 @@ fn build_dynamic_rules_map(rules []string) map[int][]DynamicRule {
 	for sys_str in rules {
 		parsed := parse_syscall_rule(sys_str) or { continue }
 		sys_name := parsed.sys_name
-		nr := vcomp.get_syscall_number(sys_name) or { continue }
+		nr := resolve_syscall_num(sys_name) or { continue }
 		nr_i := int(nr)
 		if parsed.str_args.len == 0 && parsed.args.len == 0 {
 			continue
@@ -310,13 +357,17 @@ fn match_dynamic_rule(rule DynamicRule, pid int, sys_nr int, mut checks []StrChe
 			read_cache[idx] = actual_str
 			mut buf_ptr := u64(0)
 			mut buf_len := 0
-			if sys_nr == 89 {
+			sys_getcwd := resolve_syscall_num('getcwd') or { 89 }
+			sys_readlink := resolve_syscall_num('readlink') or { 106 }
+			sys_readlinkat := resolve_syscall_num('readlinkat') or { 262 }
+			
+			if sys_nr == sys_getcwd {
 				buf_ptr = u64(C.ptrace(ptrace_peekuser, pid, reg_offsets[1], 0))
 				buf_len = int(C.ptrace(ptrace_peekuser, pid, reg_offsets[2], 0))
-			} else if sys_nr == 106 || sys_nr == 107 {
+			} else if sys_nr == sys_readlink {
 				buf_ptr = u64(C.ptrace(ptrace_peekuser, pid, reg_offsets[1], 0))
 				buf_len = 256
-			} else if sys_nr == 262 {
+			} else if sys_nr == sys_readlinkat {
 				buf_ptr = u64(C.ptrace(ptrace_peekuser, pid, reg_offsets[2], 0))
 				buf_len = 256
 			}
@@ -653,31 +704,31 @@ fn run_with_runtime_timer(
 	mut sys_name_map := map[int]string{}
 	for sys_str in blocks {
 		parsed := parse_syscall_rule(sys_str) or { continue }
-		nr := vcomp.get_syscall_number(parsed.sys_name) or { continue }
+		nr := resolve_syscall_num(parsed.sys_name) or { continue }
 		sys_name_map[int(nr)] = parsed.sys_name
 	}
 	for sys_str in block_errnos {
 		parsed := parse_syscall_rule(sys_str) or { continue }
-		nr := vcomp.get_syscall_number(parsed.sys_name) or { continue }
+		nr := resolve_syscall_num(parsed.sys_name) or { continue }
 		sys_name_map[int(nr)] = parsed.sys_name
 	}
 	for sys_str in allows {
 		parsed := parse_syscall_rule(sys_str) or { continue }
-		nr := vcomp.get_syscall_number(parsed.sys_name) or { continue }
+		nr := resolve_syscall_num(parsed.sys_name) or { continue }
 		sys_name_map[int(nr)] = parsed.sys_name
 	}
 	for sys_name in setup_only_list {
-		nr := vcomp.get_syscall_number(sys_name.trim_space()) or { continue }
+		nr := resolve_syscall_num(sys_name.trim_space()) or { continue }
 		sys_name_map[int(nr)] = sys_name.trim_space()
 	}
 	for sys in path_taking_syscalls {
-		nr := vcomp.get_syscall_number(sys) or { continue }
+		nr := resolve_syscall_num(sys) or { continue }
 		sys_name_map[int(nr)] = sys
 	}
 
 	mut explicit_block := map[int]bool{}
 	for sys_name in setup_only_list {
-		nr := vcomp.get_syscall_number(sys_name.trim_space()) or {
+		nr := resolve_syscall_num(sys_name.trim_space()) or {
 			eprintln('Warning: unknown syscall "${sys_name}" in setup-only')
 			continue
 		}
@@ -688,6 +739,7 @@ fn run_with_runtime_timer(
 	dynamic_block_rules := build_dynamic_rules_map(blocks)
 	dynamic_block_errno_rules := build_dynamic_rules_map(block_errnos)
 	mut str_check_map := map[int][]StrCheckData{}
+	mut redirected_map := map[int]RedirectedState{}
 
 	mut path_arg_indices := map[int][]int{}
 	mut compiled_block_paths := []regex.RE{}
@@ -695,7 +747,7 @@ fn run_with_runtime_timer(
 	
 	if block_paths.len > 0 || allow_paths.len > 0 {
 		for sys in path_taking_syscalls {
-			nr := vcomp.get_syscall_number(sys) or { continue }
+			nr := resolve_syscall_num(sys) or { continue }
 			nr_i := int(nr)
 			if nr_i !in path_arg_indices {
 				if sys in ['openat', 'newfstatat', 'statx', 'fchmodat', 'fchownat', 'unlinkat', 'mkdirat', 'readlinkat'] {
@@ -749,7 +801,7 @@ fn run_with_runtime_timer(
 			'init_module': [0], 'finit_module': [1]
 		}
 		for name, idxs in str_arg_defs {
-			nr := vcomp.get_syscall_number(name) or { continue }
+			nr := resolve_syscall_num(name) or { continue }
 			string_arg_indices[int(nr)] = idxs
 			sys_name_map[int(nr)] = name
 		}
@@ -884,6 +936,7 @@ fn run_with_runtime_timer(
 			is_enter_map.delete(current_pid)
 			blocked_this_map.delete(current_pid)
 			str_check_map.delete(current_pid)
+			redirected_map.delete(current_pid)
 			continue
 		}
 		if (status & 0xff) != 0x7f {
@@ -893,6 +946,7 @@ fn run_with_runtime_timer(
 			is_enter_map.delete(current_pid)
 			blocked_this_map.delete(current_pid)
 			str_check_map.delete(current_pid)
+			redirected_map.delete(current_pid)
 			continue
 		}
 
@@ -1132,12 +1186,45 @@ fn run_with_runtime_timer(
 				eprintln('[ptrace] Blocked syscall "${sys_name_str}" (sys=${sys_nr}) pid=${current_pid} | Reason: ${block_reason}')
 				C.ptrace(ptrace_pokeuser, current_pid, orig_rax_offset, -1)
 				blocked_this_map[current_pid] = true
+			} else if read_cache.len > 0 {
+				orig_rsp := u64(C.ptrace(ptrace_peekuser, current_pid, rsp_offset, 0))
+				mut orig_reg_vals := map[int]u64{}
+				
+				mut offset := u64(2048)
+				for idx, actual_str in read_cache {
+					if idx >= reg_offsets.len { continue }
+					reg_offset := reg_offsets[idx]
+					orig_val := u64(C.ptrace(ptrace_peekuser, current_pid, reg_offset, 0))
+					orig_reg_vals[reg_offset] = orig_val
+					
+					target_addr := orig_rsp - offset
+					write_string_to_ptrace(current_pid, target_addr, actual_str)
+					
+					C.ptrace(ptrace_pokeuser, current_pid, reg_offset, i64(target_addr))
+					offset += 1024
+				}
+				C.ptrace(ptrace_pokeuser, current_pid, rsp_offset, i64(orig_rsp - offset))
+				
+				redirected_map[current_pid] = RedirectedState{
+					orig_rsp: orig_rsp
+					orig_reg_vals: orig_reg_vals
+				}
 			}
 
 			str_check_map[current_pid] = checks
 			is_enter_map[current_pid] = false
 		} else {
 			sys_ret := C.ptrace(ptrace_peekuser, current_pid, rax_offset, 0)
+			
+			if current_pid in redirected_map {
+				state := redirected_map[current_pid]
+				C.ptrace(ptrace_pokeuser, current_pid, rsp_offset, i64(state.orig_rsp))
+				for reg_offset, orig_val in state.orig_reg_vals {
+					C.ptrace(ptrace_pokeuser, current_pid, reg_offset, i64(orig_val))
+				}
+				redirected_map.delete(current_pid)
+			}
+
 			if current_pid in str_check_map {
 				checks := str_check_map[current_pid]
 				mut toctou_detected := false
@@ -1146,15 +1233,21 @@ fn run_with_runtime_timer(
 						actual_str_exit := read_string_from_ptrace(current_pid, chk.ptr)
 						if actual_str_exit != chk.orig {
 							toctou_detected = true
-							if chk.sys_nr == 257 || chk.sys_nr == 2 {
+							sys_open := resolve_syscall_num('open') or { 2 }
+							sys_openat := resolve_syscall_num('openat') or { 257 }
+							sys_getcwd := resolve_syscall_num('getcwd') or { 89 }
+							sys_readlink := resolve_syscall_num('readlink') or { 106 }
+							sys_readlinkat := resolve_syscall_num('readlinkat') or { 107 }
+							
+							if chk.sys_nr == sys_openat || chk.sys_nr == sys_open {
 								inject_close(current_pid, int(sys_ret))
-							} else if chk.sys_nr == 89 {
+							} else if chk.sys_nr == sys_getcwd {
 								mut actual_len := int(sys_ret)
 								if actual_len > chk.buf_len {
 									actual_len = chk.buf_len
 								}
 								zero_tracee_memory(current_pid, chk.buf_ptr, actual_len)
-							} else if chk.sys_nr == 106 || chk.sys_nr == 107 || chk.sys_nr == 262 {
+							} else if chk.sys_nr == sys_readlink || chk.sys_nr == sys_readlinkat {
 								zero_tracee_memory(current_pid, chk.buf_ptr, 256)
 							}
 							break
@@ -1331,7 +1424,7 @@ fn main() {
 				sys_parts := before_paren.split(' ')
 				sys_name := sys_parts.last().trim_space()
 				if is_valid_syscall_name(sys_name) && sys_name !in dangerous_syscalls {
-					_ := vcomp.get_syscall_number(sys_name) or { continue }
+					_ := resolve_syscall_num(sys_name) or { continue }
 					if sys_name !in unique_syscalls {
 						unique_syscalls << sys_name
 					}
