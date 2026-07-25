@@ -5,6 +5,7 @@ import flag
 import strconv
 import term
 import vcomp
+import regex
 
 #include <sys/ptrace.h>
 #include <sys/wait.h>
@@ -119,6 +120,39 @@ struct StrCheckData {
 	buf_len  int
 }
 
+struct DynamicRule {
+	str_args map[int][]regex.RE
+	u64_args []vcomp.ArgRule
+}
+
+fn glob_to_regex(glob string) string {
+	mut s := []u8{}
+	s << `^`
+	for i := 0; i < glob.len; i++ {
+		c := glob[i]
+		match c {
+			`*` { s << `.`; s << `*` }
+			`?` { s << `.` }
+			`.`, `+`, `(`, `)`, `{`, `}`, `[`, `]`, `^`, `$`, `|`, `\\` {
+				s << `\\`; s << c
+			}
+			else { s << c }
+		}
+	}
+	s << `$`.bytes()
+	return s.bytestr()
+}
+
+fn op_to_str(op vcomp.Op) string {
+	return match op {
+		.eq { '==' }
+		.neq { '!=' }
+		.ge { '>=' }
+		.gt { '>' }
+		.bits_set { '&' }
+	}
+}
+
 fn find_common_prefix(strings []string) string {
 	if strings.len == 0 {
 		return ''
@@ -126,7 +160,6 @@ fn find_common_prefix(strings []string) string {
 	if strings.len == 1 {
 		return strings[0]
 	}
-
 	mut prefix := strings[0]
 	for i in 1 .. strings.len {
 		mut j := 0
@@ -138,7 +171,6 @@ fn find_common_prefix(strings []string) string {
 			break
 		}
 	}
-
 	if prefix.len > 0 {
 		mut last_delim := -1
 		for i := 0; i < prefix.len; i++ {
@@ -186,17 +218,14 @@ fn inject_close(pid int, fd int) {
 	saved_orig_rax := C.ptrace(ptrace_peekuser, pid, orig_rax_offset, 0)
 	saved_arg0 := C.ptrace(ptrace_peekuser, pid, reg_offsets[0], 0)
 	saved_rip := C.ptrace(ptrace_peekuser, pid, rip_offset, 0)
-
 	C.ptrace(ptrace_pokeuser, pid, orig_rax_offset, 3)
 	C.ptrace(ptrace_pokeuser, pid, reg_offsets[0], i64(fd))
 	C.ptrace(ptrace_pokeuser, pid, rip_offset, saved_rip - syscall_size)
-
 	mut status := 0
 	C.ptrace(ptrace_syscall_op, pid, 0, 0)
 	C.waitpid(pid, &status, 0)
 	C.ptrace(ptrace_syscall_op, pid, 0, 0)
 	C.waitpid(pid, &status, 0)
-
 	C.ptrace(ptrace_pokeuser, pid, orig_rax_offset, saved_orig_rax)
 	C.ptrace(ptrace_pokeuser, pid, reg_offsets[0], saved_arg0)
 	C.ptrace(ptrace_pokeuser, pid, rip_offset, saved_rip)
@@ -212,38 +241,100 @@ fn zero_tracee_memory(pid int, addr u64, len int) {
 	}
 }
 
-fn build_str_rules_map(rules []string) map[int]map[int][]string {
-	mut m := map[int]map[int][]string{}
+fn build_dynamic_rules_map(rules []string) map[int][]DynamicRule {
+	mut m := map[int][]DynamicRule{}
 	for sys_str in rules {
 		parsed := parse_syscall_rule(sys_str) or { continue }
-		if parsed.str_args.len == 0 {
-			continue
-		}
 		sys_name := parsed.sys_name
 		nr := vcomp.get_syscall_number(sys_name) or { continue }
 		nr_i := int(nr)
-		if nr_i !in m {
-			m[nr_i] = map[int][]string{}
+		if parsed.str_args.len == 0 && parsed.args.len == 0 {
+			continue
 		}
+		mut str_args_map := map[int][]regex.RE{}
 		for s_rule in parsed.str_args {
 			parts := s_rule.split('==')
 			if parts.len != 2 {
 				continue
 			}
 			idx := parts[0].trim_space().int()
-			
 			if sys_name in output_buffer_args && idx in output_buffer_args[sys_name] {
 				continue
 			}
-			
-			val := parts[1].trim_space().trim_left('"').trim_right('"')
-			if idx !in m[nr_i] {
-				m[nr_i][idx] = []string{}
+			pattern := parts[1].trim_space().trim_left('"').trim_right('"')
+			re := regex.regex_opt(pattern) or {
+				eprintln('Invalid regex "${pattern}": ${err}')
+				continue
 			}
-			m[nr_i][idx] << val
+			if idx !in str_args_map {
+				str_args_map[idx] = []regex.RE{}
+			}
+			str_args_map[idx] << re
 		}
+		entry := DynamicRule{
+			str_args: str_args_map
+			u64_args: parsed.args
+		}
+		m[nr_i] << entry
 	}
 	return m
+}
+
+fn match_dynamic_rule(rule DynamicRule, pid int, sys_nr int, mut checks []StrCheckData, mut read_cache map[int]string) (bool, string) {
+	for u64_arg in rule.u64_args {
+		if u64_arg.index >= reg_offsets.len { return false, 'u64 arg index out of bounds' }
+		reg_offset := reg_offsets[u64_arg.index]
+		reg_val := u64(C.ptrace(ptrace_peekuser, pid, reg_offset, 0))
+		mut matched := false
+		match u64_arg.op {
+			.eq { if reg_val == u64_arg.value { matched = true } }
+			.neq { if reg_val != u64_arg.value { matched = true } }
+			.ge { if reg_val >= u64_arg.value { matched = true } }
+			.gt { if reg_val > u64_arg.value { matched = true } }
+			.bits_set { if (reg_val & u64_arg.value) == u64_arg.value { matched = true } }
+		}
+		if !matched {
+			return false, 'u64 arg[${u64_arg.index}]=0x${reg_val.hex()} did not match ${op_to_str(u64_arg.op)} 0x${u64_arg.value.hex()}'
+		}
+	}
+	for idx, allowed_res in rule.str_args {
+		if idx >= reg_offsets.len { return false, 'str arg index out of bounds' }
+		mut actual_str := ''
+		if idx in read_cache {
+			actual_str = read_cache[idx]
+		} else {
+			reg_offset := reg_offsets[idx]
+			arg_ptr := u64(C.ptrace(ptrace_peekuser, pid, reg_offset, 0))
+			if arg_ptr < 0x10000 { return false, 'str arg[${idx}] has invalid pointer 0x${arg_ptr.hex()}' }
+			actual_str = read_string_from_ptrace(pid, arg_ptr)
+			read_cache[idx] = actual_str
+			mut buf_ptr := u64(0)
+			mut buf_len := 0
+			if sys_nr == 89 {
+				buf_ptr = u64(C.ptrace(ptrace_peekuser, pid, reg_offsets[1], 0))
+				buf_len = int(C.ptrace(ptrace_peekuser, pid, reg_offsets[2], 0))
+			} else if sys_nr == 106 || sys_nr == 107 {
+				buf_ptr = u64(C.ptrace(ptrace_peekuser, pid, reg_offsets[1], 0))
+				buf_len = 256
+			} else if sys_nr == 262 {
+				buf_ptr = u64(C.ptrace(ptrace_peekuser, pid, reg_offsets[2], 0))
+				buf_len = 256
+			}
+			checks << StrCheckData{arg_ptr, actual_str, sys_nr, buf_ptr, buf_len}
+		}
+		mut matched_any := false
+		for re in allowed_res {
+			start, end := re.match_string(actual_str)
+			if start >= 0 && end >= start {
+				matched_any = true
+				break
+			}
+		}
+		if !matched_any {
+			return false, 'str arg[${idx}]="${actual_str}" did not match any pattern'
+		}
+	}
+	return true, 'matched all conditions'
 }
 
 fn is_all_digits(s string) bool {
@@ -421,7 +512,6 @@ fn is_valid_syscall_name(s string) bool {
 fn parse_condition(cond string) !vcomp.ArgRule {
 	mut op := vcomp.Op.eq
 	mut op_str := ''
-
 	if cond.contains('==') {
 		op = .eq
 		op_str = '=='
@@ -440,17 +530,14 @@ fn parse_condition(cond string) !vcomp.ArgRule {
 	} else {
 		return error('invalid operator in condition: ' + cond)
 	}
-
 	parts := cond.split(op_str)
 	if parts.len != 2 {
 		return error('invalid condition format: ' + cond)
 	}
-
 	idx := parts[0].trim_space().int()
 	if idx < 0 || idx > 5 {
 		return error('syscall argument index must be between 0 and 5')
 	}
-
 	val_str := parts[1].trim_space()
 	mut val := u64(0)
 	if val_str.starts_with('0x') || val_str.starts_with('0X') {
@@ -462,7 +549,6 @@ fn parse_condition(cond string) !vcomp.ArgRule {
 	} else {
 		val = val_str.u64()
 	}
-
 	return vcomp.ArgRule{
 		index: idx
 		op: op
@@ -479,7 +565,6 @@ fn parse_syscall_rule(input string) !ParsedSyscall {
 			str_args: []
 		}
 	}
-
 	sys_name := input[0..idx].trim_space()
 	conds_str := input[idx + 1..].trim_space()
 	if conds_str == '' {
@@ -489,7 +574,6 @@ fn parse_syscall_rule(input string) !ParsedSyscall {
 			str_args: []
 		}
 	}
-
 	mut cond_parts := []string{}
 	mut current := ''
 	mut in_quote := false
@@ -508,7 +592,6 @@ fn parse_syscall_rule(input string) !ParsedSyscall {
 	if current.trim_space() != '' {
 		cond_parts << current.trim_space()
 	}
-
 	mut args := []vcomp.ArgRule{}
 	mut str_args := []string{}
 	for cond in cond_parts {
@@ -522,7 +605,6 @@ fn parse_syscall_rule(input string) !ParsedSyscall {
 			}
 		}
 	}
-
 	return ParsedSyscall{
 		sys_name: sys_name
 		args: args
@@ -563,7 +645,36 @@ fn run_with_runtime_timer(
 	blocks []string,
 	block_errnos []string,
 	allows []string,
+	block_paths []string,
+	allow_paths []string,
+	block_strings []string,
+	allow_strings []string
 ) {
+	mut sys_name_map := map[int]string{}
+	for sys_str in blocks {
+		parsed := parse_syscall_rule(sys_str) or { continue }
+		nr := vcomp.get_syscall_number(parsed.sys_name) or { continue }
+		sys_name_map[int(nr)] = parsed.sys_name
+	}
+	for sys_str in block_errnos {
+		parsed := parse_syscall_rule(sys_str) or { continue }
+		nr := vcomp.get_syscall_number(parsed.sys_name) or { continue }
+		sys_name_map[int(nr)] = parsed.sys_name
+	}
+	for sys_str in allows {
+		parsed := parse_syscall_rule(sys_str) or { continue }
+		nr := vcomp.get_syscall_number(parsed.sys_name) or { continue }
+		sys_name_map[int(nr)] = parsed.sys_name
+	}
+	for sys_name in setup_only_list {
+		nr := vcomp.get_syscall_number(sys_name.trim_space()) or { continue }
+		sys_name_map[int(nr)] = sys_name.trim_space()
+	}
+	for sys in path_taking_syscalls {
+		nr := vcomp.get_syscall_number(sys) or { continue }
+		sys_name_map[int(nr)] = sys
+	}
+
 	mut explicit_block := map[int]bool{}
 	for sys_name in setup_only_list {
 		nr := vcomp.get_syscall_number(sys_name.trim_space()) or {
@@ -573,8 +684,84 @@ fn run_with_runtime_timer(
 		explicit_block[int(nr)] = true
 	}
 
-	ptrace_str_rules := build_str_rules_map(allows)
+	dynamic_allow_rules := build_dynamic_rules_map(allows)
+	dynamic_block_rules := build_dynamic_rules_map(blocks)
+	dynamic_block_errno_rules := build_dynamic_rules_map(block_errnos)
 	mut str_check_map := map[int][]StrCheckData{}
+
+	mut path_arg_indices := map[int][]int{}
+	mut compiled_block_paths := []regex.RE{}
+	mut compiled_allow_paths := []regex.RE{}
+	
+	if block_paths.len > 0 || allow_paths.len > 0 {
+		for sys in path_taking_syscalls {
+			nr := vcomp.get_syscall_number(sys) or { continue }
+			nr_i := int(nr)
+			if nr_i !in path_arg_indices {
+				if sys in ['openat', 'newfstatat', 'statx', 'fchmodat', 'fchownat', 'unlinkat', 'mkdirat', 'readlinkat'] {
+					path_arg_indices[nr_i] = [1]
+				} else if sys in ['renameat', 'renameat2', 'linkat'] {
+					path_arg_indices[nr_i] = [1, 3]
+				} else if sys in ['rename', 'link'] {
+					path_arg_indices[nr_i] = [0, 1]
+				} else {
+					path_arg_indices[nr_i] = [0]
+				}
+			}
+		}
+		for b_path in block_paths {
+			re_pattern := glob_to_regex(b_path)
+			re := regex.regex_opt(re_pattern) or {
+				eprintln('Invalid path regex "${b_path}": ${err}')
+				continue
+			}
+			compiled_block_paths << re
+		}
+		for a_path in allow_paths {
+			re_pattern := glob_to_regex(a_path)
+			re := regex.regex_opt(re_pattern) or {
+				eprintln('Invalid path regex "${a_path}": ${err}')
+				continue
+			}
+			compiled_allow_paths << re
+		}
+	}
+
+	mut string_arg_indices := map[int][]int{}
+	mut compiled_block_strings := []regex.RE{}
+	mut compiled_allow_strings := []regex.RE{}
+
+	if block_strings.len > 0 || allow_strings.len > 0 {
+		str_arg_defs := {
+			'open': [0], 'openat': [1], 'execve': [0], 'execveat': [1],
+			'chdir': [0], 'chroot': [0], 'access': [0], 'faccessat': [1],
+			'stat': [0], 'lstat': [0], 'newfstatat': [1], 'statx': [1],
+			'chmod': [0], 'fchmodat': [1], 'chown': [0], 'lchown': [0], 'fchownat': [1],
+			'unlink': [0], 'unlinkat': [1], 'rmdir': [0], 'mkdir': [0], 'mkdirat': [1],
+			'rename': [0, 1], 'renameat': [1, 3], 'renameat2': [1, 3],
+			'link': [0, 1], 'linkat': [1, 3], 'symlink': [0, 1], 'symlinkat': [0, 2],
+			'readlink': [0], 'readlinkat': [1], 'truncate': [0],
+			'mount': [0, 1, 2], 'umount2': [0], 'pivot_root': [0, 1],
+			'setxattr': [0, 1], 'lsetxattr': [0, 1], 'fsetxattr': [1],
+			'getxattr': [0, 1], 'lgetxattr': [0, 1], 'fgetxattr': [1],
+			'removexattr': [0], 'lremovexattr': [0], 'fremovexattr': [1],
+			'acct': [0], 'swapon': [0], 'swapoff': [0], 'quotactl': [1],
+			'init_module': [0], 'finit_module': [1]
+		}
+		for name, idxs in str_arg_defs {
+			nr := vcomp.get_syscall_number(name) or { continue }
+			string_arg_indices[int(nr)] = idxs
+			sys_name_map[int(nr)] = name
+		}
+		for b_str in block_strings {
+			re := regex.regex_opt(b_str) or { continue }
+			compiled_block_strings << re
+		}
+		for a_str in allow_strings {
+			re := regex.regex_opt(a_str) or { continue }
+			compiled_allow_strings << re
+		}
+	}
 
 	has_static_rules := blocks.len > 0 || block_errnos.len > 0 || allows.len > 0
 
@@ -587,7 +774,6 @@ fn run_with_runtime_timer(
 	if pid == 0 {
 		C.ptrace(ptrace_traceme, 0, 0, 0)
 		C.prctl(pr_set_pdeathsig, sigkill_const, 0, 0, 0)
-
 		if has_static_rules {
 			filter_type := match filter_type_str {
 				'allowlist' { vcomp.FilterType.allowlist }
@@ -620,7 +806,6 @@ fn run_with_runtime_timer(
 				C._exit(1)
 			}
 		}
-
 		os.execvp(target_cmd, target_args) or {
 			eprintln('Error executing target: ${err}')
 			C._exit(1)
@@ -643,12 +828,10 @@ fn run_with_runtime_timer(
 	mut tv := C.timeval{}
 	C.gettimeofday(&tv, unsafe { nil })
 	start_time := f64(tv.tv_sec) + f64(tv.tv_usec) / 1e6
-
 	obs_time := if runtime_time > 5 { 5 } else if runtime_time < 1 { 1 } else { runtime_time }
 
 	mut phase := 1
 	mut obs_start := f64(0)
-
 	mut current_pid := pid
 	mut pending_sig := 0
 	mut skip_ptrace := false
@@ -665,15 +848,12 @@ fn run_with_runtime_timer(
 		} else {
 			skip_ptrace = false
 		}
-
 		ret := C.waitpid(-1, &status, ptrace_wall)
-		
 		if ret <= 0 {
 			if get_errno() == eintr_const && runtime_time > 0 {
 				skip_ptrace = true
 				C.gettimeofday(&tv, unsafe { nil })
 				now := f64(tv.tv_sec) + f64(tv.tv_usec) / 1e6
-				
 				if phase == 1 && (now - start_time) >= f64(runtime_time) {
 					if explicit_block.len > 0 {
 						phase = 3
@@ -689,7 +869,6 @@ fn run_with_runtime_timer(
 					phase = 3
 				}
 			}
-			
 			if get_errno() == 10 {
 				break
 			}
@@ -742,7 +921,6 @@ fn run_with_runtime_timer(
 
 		if is_enter_map[current_pid] {
 			sys_nr := int(C.ptrace(ptrace_peekuser, current_pid, orig_rax_offset, 0))
-
 			C.gettimeofday(&tv, unsafe { nil })
 			now := f64(tv.tv_sec) + f64(tv.tv_usec) / 1e6
 			elapsed := now - start_time
@@ -760,7 +938,6 @@ fn run_with_runtime_timer(
 						C.alarm(u32(obs_time))
 					}
 				}
-
 				if phase == 2 && (now - obs_start) >= f64(obs_time) {
 					phase = 3
 				}
@@ -769,6 +946,7 @@ fn run_with_runtime_timer(
 			blocked_this_map[current_pid] = false
 			mut blocked_by_str := false
 			mut do_str_check := false
+			mut str_block_detail := ''
 
 			if runtime_time > 0 && phase == 3 {
 				do_str_check = true
@@ -776,87 +954,198 @@ fn run_with_runtime_timer(
 				do_str_check = true
 			}
 
-			if do_str_check && sys_nr in ptrace_str_rules {
-				mut checks := []StrCheckData{}
-				mut all_match := true
-				for idx, allowed_strs in ptrace_str_rules[sys_nr] {
-					reg_offset := reg_offsets[idx]
-					arg_ptr := u64(C.ptrace(ptrace_peekuser, current_pid, reg_offset, 0))
-					
-					if arg_ptr < 0x10000 {
-						continue
-					}
-					
-					actual_str := read_string_from_ptrace(current_pid, arg_ptr)
-					
-					mut buf_ptr := u64(0)
-					mut buf_len := 0
-					if sys_nr == 89 {
-						buf_ptr = u64(C.ptrace(ptrace_peekuser, current_pid, reg_offsets[1], 0))
-						buf_len = int(C.ptrace(ptrace_peekuser, current_pid, reg_offsets[2], 0))
-					} else if sys_nr == 106 || sys_nr == 107 {
-						buf_ptr = u64(C.ptrace(ptrace_peekuser, current_pid, reg_offsets[1], 0))
-						buf_len = 256
-					} else if sys_nr == 262 {
-						buf_ptr = u64(C.ptrace(ptrace_peekuser, current_pid, reg_offsets[2], 0))
-						buf_len = 256
-					}
-					
-					checks << StrCheckData{arg_ptr, actual_str, sys_nr, buf_ptr, buf_len}
-					
-					mut matched_any := false
-					for allowed in allowed_strs {
-						if allowed.ends_with('*') {
-							if actual_str.starts_with(allowed[..allowed.len - 1]) {
-								matched_any = true
-								break
-							}
-						} else if actual_str == allowed {
-							matched_any = true
+			mut checks := []StrCheckData{}
+			mut read_cache := map[int]string{}
+
+			if do_str_check {
+				mut matched_block := false
+				if sys_nr in dynamic_block_rules {
+					for rule in dynamic_block_rules[sys_nr] {
+						res, detail := match_dynamic_rule(rule, current_pid, sys_nr, mut checks, mut read_cache)
+						if res {
+							matched_block = true
+							str_block_detail = 'explicit block rule matched: ${detail}'
 							break
 						}
 					}
-					if !matched_any {
-						all_match = false
+				}
+				if !matched_block && sys_nr in dynamic_block_errno_rules {
+					for rule in dynamic_block_errno_rules[sys_nr] {
+						res, detail := match_dynamic_rule(rule, current_pid, sys_nr, mut checks, mut read_cache)
+						if res {
+							matched_block = true
+							str_block_detail = 'explicit block-errno rule matched: ${detail}'
+							break
+						}
 					}
 				}
-				str_check_map[current_pid] = checks
-				if !all_match {
+				if matched_block {
 					blocked_by_str = true
+				} else if sys_nr in dynamic_allow_rules {
+					mut matched_allow := false
+					for rule in dynamic_allow_rules[sys_nr] {
+						res, _ := match_dynamic_rule(rule, current_pid, sys_nr, mut checks, mut read_cache)
+						if res {
+							matched_allow = true
+							break
+						}
+					}
+					if !matched_allow {
+						blocked_by_str = true
+						mut args_str_list := []string{}
+						for idx, s in read_cache {
+							args_str_list << 'arg[${idx}]="${s}"'
+						}
+						if args_str_list.len > 0 {
+							str_block_detail = 'no allow rule matched. Args observed: ${args_str_list.join(", ")}'
+						} else {
+							str_block_detail = 'no allow rule matched'
+						}
+					}
+				}
+			}
+
+			mut path_blocked := false
+			mut blocked_path_str := ''
+			mut blocked_by_allowlist := false
+
+			if (compiled_block_paths.len > 0 || compiled_allow_paths.len > 0) && sys_nr in path_arg_indices {
+				for idx in path_arg_indices[sys_nr] {
+					if idx >= reg_offsets.len { continue }
+					reg_offset := reg_offsets[idx]
+					arg_ptr := u64(C.ptrace(ptrace_peekuser, current_pid, reg_offset, 0))
+					if arg_ptr < 0x10000 { continue }
+					mut actual_path := ''
+					if idx in read_cache {
+						actual_path = read_cache[idx]
+					} else {
+						actual_path = read_string_from_ptrace(current_pid, arg_ptr)
+						read_cache[idx] = actual_path
+						checks << StrCheckData{arg_ptr, actual_path, sys_nr, u64(0), 0}
+					}
+					for re in compiled_block_paths {
+						start, end := re.match_string(actual_path)
+						if start >= 0 && end >= start {
+							path_blocked = true
+							blocked_path_str = actual_path
+							break
+						}
+					}
+					if path_blocked { break }
+					if compiled_allow_paths.len > 0 && !path_blocked {
+						mut is_allowed := false
+						for re in compiled_allow_paths {
+							start, end := re.match_string(actual_path)
+							if start >= 0 && end >= start {
+								is_allowed = true
+								break
+							}
+						}
+						if !is_allowed {
+							path_blocked = true
+							blocked_by_allowlist = true
+							blocked_path_str = actual_path
+						}
+					}
+				}
+			}
+
+			mut string_blocked := false
+			mut blocked_string_val := ''
+			mut str_blocked_by_allowlist := false
+
+			if (compiled_block_strings.len > 0 || compiled_allow_strings.len > 0) && sys_nr in string_arg_indices {
+				for idx in string_arg_indices[sys_nr] {
+					if idx >= reg_offsets.len { continue }
+					reg_offset := reg_offsets[idx]
+					arg_ptr := u64(C.ptrace(ptrace_peekuser, current_pid, reg_offset, 0))
+					if arg_ptr < 0x10000 { continue }
+					mut actual_str := ''
+					if idx in read_cache {
+						actual_str = read_cache[idx]
+					} else {
+						actual_str = read_string_from_ptrace(current_pid, arg_ptr)
+						read_cache[idx] = actual_str
+						checks << StrCheckData{arg_ptr, actual_str, sys_nr, u64(0), 0}
+					}
+					for re in compiled_block_strings {
+						start, end := re.match_string(actual_str)
+						if start >= 0 && end >= start {
+							string_blocked = true
+							blocked_string_val = actual_str
+							break
+						}
+					}
+					if string_blocked { break }
+					if compiled_allow_strings.len > 0 && !string_blocked {
+						mut is_allowed := false
+						for re in compiled_allow_strings {
+							start, end := re.match_string(actual_str)
+							if start >= 0 && end >= start {
+								is_allowed = true
+								break
+							}
+						}
+						if !is_allowed {
+							string_blocked = true
+							str_blocked_by_allowlist = true
+							blocked_string_val = actual_str
+						}
+					}
 				}
 			}
 
 			mut should_block := false
-			if runtime_time > 0 && phase == 3 {
-				if sys_nr in blocked_set || blocked_by_str {
+			mut block_reason := ''
+
+			if path_blocked {
+				should_block = true
+				if blocked_by_allowlist {
+					block_reason = 'path allowlist block: accessed "${blocked_path_str}" not in allowed paths'
+				} else {
+					block_reason = 'path block: accessed "${blocked_path_str}"'
+				}
+			} else if string_blocked {
+				should_block = true
+				if str_blocked_by_allowlist {
+					block_reason = 'string allowlist block: string "${blocked_string_val}" not in allowed strings'
+				} else {
+					block_reason = 'string block: detected string "${blocked_string_val}"'
+				}
+			} else if runtime_time > 0 && phase == 3 {
+				if sys_nr in blocked_set {
 					should_block = true
+					block_reason = 'blocked in setup-only set (expired)'
+				} else if blocked_by_str {
+					should_block = true
+					block_reason = str_block_detail
 				}
 			} else if runtime_time == 0 {
 				if blocked_by_str {
 					should_block = true
+					block_reason = str_block_detail
 				}
 			}
 
 			if should_block {
-				eprintln('[ptrace] Blocked sys=${sys_nr} pid=${current_pid} (by_str=${blocked_by_str}, in_set=${sys_nr in blocked_set})')
+				sys_name_str := if sys_nr in sys_name_map { sys_name_map[sys_nr] } else { 'sys_' + sys_nr.str() }
+				eprintln('[ptrace] Blocked syscall "${sys_name_str}" (sys=${sys_nr}) pid=${current_pid} | Reason: ${block_reason}')
 				C.ptrace(ptrace_pokeuser, current_pid, orig_rax_offset, -1)
 				blocked_this_map[current_pid] = true
 			}
 
+			str_check_map[current_pid] = checks
 			is_enter_map[current_pid] = false
 		} else {
 			sys_ret := C.ptrace(ptrace_peekuser, current_pid, rax_offset, 0)
-			
 			if current_pid in str_check_map {
 				checks := str_check_map[current_pid]
 				mut toctou_detected := false
-				
 				if sys_ret >= 0 {
 					for chk in checks {
 						actual_str_exit := read_string_from_ptrace(current_pid, chk.ptr)
 						if actual_str_exit != chk.orig {
 							toctou_detected = true
-							
 							if chk.sys_nr == 257 || chk.sys_nr == 2 {
 								inject_close(current_pid, int(sys_ret))
 							} else if chk.sys_nr == 89 {
@@ -878,7 +1167,6 @@ fn run_with_runtime_timer(
 					C.ptrace(ptrace_pokeuser, current_pid, rax_offset, -errno_code)
 				}
 			}
-
 			if blocked_this_map[current_pid] {
 				C.ptrace(ptrace_pokeuser, current_pid, rax_offset, -errno_code)
 			}
@@ -891,8 +1179,7 @@ fn main() {
 	mut fp := flag.new_flag_parser(os.args)
 	fp.application('waterjail')
 	fp.version('0.1.3')
-	fp.description('A CLI tool to sandbox programs using custom syscall filters with argument evaluation.')
-
+	fp.description('A CLI tool to sandbox programs using custom syscall filters with argument and regex evaluation.')
 	fp.skip_executable()
 
 	blocks := fp.string_multi('block', `b`, 'Block a syscall. Format: <name> or <name>:<arg_index><op><value>')
@@ -905,6 +1192,11 @@ fn main() {
 	setup_time := fp.int('setup-time', 0, 0, 'Setup timer in seconds for analyze mode (0 = disabled)')
 	runtime_time := fp.int('runtime-time', 0, 0, 'Runtime timer in seconds for execution mode (0 = disabled)')
 	setup_only := fp.string_multi('setup-only', `s`, 'Syscall allowed only during runtime timer period, blocked after')
+	block_paths := fp.string_multi('block-path', `P`, 'Globally block a path (supports wildcards *, ?) for all path-taking syscalls')
+	allow_paths := fp.string_multi('allow-path', `W`, 'Globally allow a path (supports wildcards *, ?). If set, blocks all other path accesses.')
+	
+	block_strings := fp.string_multi('block-string', `B`, 'Globally block any string matching regex')
+	allow_strings := fp.string_multi('allow-string', `S`, 'Globally allow any string matching regex. If set, blocks all other string inputs.')
 
 	remaining_args := fp.finalize() or {
 		eprintln('Error parsing flags: ${err}')
@@ -930,7 +1222,6 @@ fn main() {
 		}
 
 		temp_file := os.join_path(os.temp_dir(), 'waterjail_strace_${os.getpid()}.txt')
-
 		mut p := os.new_process(strace_path)
 		mut strace_args := ['-f']
 		if setup_time > 0 {
@@ -946,15 +1237,12 @@ fn main() {
 		mut socket_domains := []u64{}
 		mut mprotect_unified_mask := u64(0)
 		mut mmap_unified_mask := u64(0)
-
 		mut arg_profiles := map[string][]u64{}
 		mut str_arg_profiles := map[string][]string{}
 		mut syscall_dynamic_args := map[string]bool{}
 		mut ephemeral_values := []u64{}
-
 		mut syscall_min_args := map[string]int{}
 		mut syscall_max_args := map[string]int{}
-
 		mut setup_phase_syscalls := map[string]bool{}
 		mut runtime_phase_syscalls := map[string]bool{}
 		mut first_timestamp := f64(-1)
@@ -962,7 +1250,6 @@ fn main() {
 		lines := os.read_lines(temp_file) or { []string{} }
 		for line in lines {
 			trimmed := line.trim_space()
-
 			ret_val := extract_return_value(trimmed) or { u64(0) }
 			if ret_val > 2 {
 				if ret_val !in ephemeral_values {
@@ -1048,12 +1335,10 @@ fn main() {
 					if sys_name !in unique_syscalls {
 						unique_syscalls << sys_name
 					}
-
 					if sys_name !in syscall_min_args {
 						syscall_min_args[sys_name] = 999
 						syscall_max_args[sys_name] = 0
 					}
-
 					if current_phase == 1 {
 						setup_phase_syscalls[sys_name] = true
 					} else if current_phase == 2 {
@@ -1064,21 +1349,17 @@ fn main() {
 						args_str := cmd_part.all_after('(').all_before(')')
 						clean_args := clean_strace_args(args_str)
 						parts := smart_split_args(clean_args)
-						
 						if parts.len < syscall_min_args[sys_name] {
 							syscall_min_args[sys_name] = parts.len
 						}
 						if parts.len > syscall_max_args[sys_name] {
 							syscall_max_args[sys_name] = parts.len
 						}
-
 						for i, part in parts {
 							if i >= 6 {
 								break
 							}
-
 							arg_key := sys_name + '_' + i.str()
-
 							if syscall_min_args[sys_name] != syscall_max_args[sys_name] && i >= syscall_min_args[sys_name] {
 								syscall_dynamic_args[arg_key] = true
 								if arg_key in arg_profiles {
@@ -1086,7 +1367,6 @@ fn main() {
 								}
 								continue
 							}
-
 							trimmed_part := part.trim_space()
 							if trimmed_part == '' {
 								continue
@@ -1095,11 +1375,9 @@ fn main() {
 								if sys_name in output_buffer_args && i in output_buffer_args[sys_name] {
 									continue
 								}
-								
 								if sys_name !in path_taking_syscalls {
 									continue
 								}
-
 								s := trimmed_part.trim_left('"\'').trim_right('"\'')
 								if s.len > 0 && s.len < 256 && !s.contains(',') && !s.contains('"') && !s.contains('\\') {
 									if arg_key !in str_arg_profiles {
@@ -1117,11 +1395,9 @@ fn main() {
 							if is_pointer_address(trimmed_part) {
 								continue
 							}
-
 							if syscall_dynamic_args[arg_key] {
 								continue
 							}
-
 							val := try_parse_flags(trimmed_part) or {
 								if has_digits_or_letters(trimmed_part) {
 									syscall_dynamic_args[arg_key] = true
@@ -1131,7 +1407,6 @@ fn main() {
 								}
 								continue
 							}
-
 							if val in ephemeral_values {
 								syscall_dynamic_args[arg_key] = true
 								if arg_key in arg_profiles {
@@ -1139,7 +1414,6 @@ fn main() {
 								}
 								continue
 							}
-
 							if arg_key !in arg_profiles {
 								arg_profiles[arg_key] = []u64{}
 							}
@@ -1212,7 +1486,7 @@ fn main() {
 						strs := str_arg_profiles[key]
 						prefix := find_common_prefix(strs)
 						if strs.len > 1 && prefix.len > 2 {
-							str_rules << '${i}=="${prefix}*"'
+							str_rules << '${i}=="${prefix}.*"'
 						} else {
 							if strs.len <= 5 {
 								for s in strs {
@@ -1237,16 +1511,27 @@ fn main() {
 					cmd_builder << '-a ${sys}'
 				}
 			}
-
 			if setup_time > 0 && sys in setup_only_syscalls {
 				cmd_builder << '--setup-only ${sys}'
 			}
 		}
+		
+		if block_paths.len > 0 {
+			for bp in block_paths {
+				cmd_builder << "--block-path ${bp}"
+			}
+		}
+		if allow_paths.len > 0 {
+			for ap in allow_paths {
+				cmd_builder << "--allow-path ${ap}"
+			}
+		}
+
 		cmd_builder << '--'
 		cmd_builder << target_cmd
 		cmd_builder << target_args.join(' ')
 
-		script_content := cmd_builder.join(' ')
+		script_content := cmd_builder.join(' ') + ' "$@"'
 		script_file := os.base(target_cmd) + '.sh'
 		
 		os.write_file(script_file, '#!/bin/sh\nexec ' + script_content + '\n') or {
@@ -1261,11 +1546,11 @@ fn main() {
 			println(term.cyan('Setup timer: ${setup_time}s | Setup-only: ${setup_only_syscalls.len} | Always-needed: ${unique_syscalls.len - setup_only_syscalls.len}'))
 		}
 		println(term.green('Generated hardened script: ${script_file}'))
-		println(term.cyan('Run it using: ./${script_file}'))
+		println(term.cyan('Run it using: ./${script_file} [args...]'))
 		exit(0)
 	}
 
-	if blocks.len == 0 && block_errnos.len == 0 && allows.len == 0 && runtime_time == 0 {
+	if blocks.len == 0 && block_errnos.len == 0 && allows.len == 0 && runtime_time == 0 && block_paths.len == 0 && allow_paths.len == 0 && block_strings.len == 0 && allow_strings.len == 0 {
 		eprintln('Error: No syscall filter rules specified.')
 		eprintln('If you are using "v run", please use the long flag "--block-errno" instead of "-e",')
 		eprintln('or compile the binary first and run it directly to avoid flag interception.')
@@ -1277,6 +1562,22 @@ fn main() {
 		if sys_str.contains('=="') {
 			has_string_rules = true
 			break
+		}
+	}
+	if !has_string_rules {
+		for sys_str in blocks {
+			if sys_str.contains('=="') {
+				has_string_rules = true
+				break
+			}
+		}
+	}
+	if !has_string_rules {
+		for sys_str in block_errnos {
+			if sys_str.contains('=="') {
+				has_string_rules = true
+				break
+			}
 		}
 	}
 
@@ -1322,10 +1623,10 @@ fn main() {
 		}
 	}
 
-	if runtime_time > 0 || has_string_rules {
+	if runtime_time > 0 || has_string_rules || block_paths.len > 0 || allow_paths.len > 0 || block_strings.len > 0 || allow_strings.len > 0 {
 		run_with_runtime_timer(
 			target_cmd, target_args, runtime_time, setup_only, errno_code,
-			filter_type_str, blocks, block_errnos, allows,
+			filter_type_str, blocks, block_errnos, allows, block_paths, allow_paths, block_strings, allow_strings
 		)
 		return
 	}
