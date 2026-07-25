@@ -77,47 +77,135 @@ sudo apt update -y && sudo apt install -y git clang make strace && if ! command 
 
 ---
 
-## Usage
+# Usage
+Here is a professional, technically accurate, and native-English README block tailored for standard GitHub documentation or a man page. It contains no emojis, promotional language, or subjective claims, focusing purely on usage and architecture.
 
-### Dynamic Analysis Mode
-To secure a massive, multi-threaded application like Tor Browser or any other executable, run `waterjail` in Analysis Mode (`-A`):
+## Table of Contents
+1. [Basic Syntax](#basic-syntax)
+2. [Syscall Rule Definition](#syscall-rule-definition)
+3. [Global Filtering (Paths and Strings)](#global-filtering-paths-and-strings)
+4. [Execution Phases and Timers](#execution-phases-and-timers)
+5. [Automated Analysis Mode](#automated-analysis-mode)
+6. [Command-Line Options Reference](#command-line-options-reference)
 
-```sh
-./waterjail -A --setup-time 5 -- tor-browser
-```
-1. Run the target application, perform your normal operations, and close it.
-2. `waterjail` parses the system log, deduplicates overlapping executions, builds safe bitmasks, and tracks I/O FDs.
-3. It automatically writes the generated hardened command to an executable shell script named `<target>.sh`.
+---
+
+## Basic Syntax
+
+The standard invocation requires specifying the filter type, the associated rules, and the target application:
 
 ```bash
-# Output: Generated hardened script: start-tor-browser.sh
-./start-tor-browser.sh
+waterjail [OPTIONS] -- <target_command> [args...]
 ```
 
-### Allowlist Mode (Default)
-In allowlist mode (`-t allowlist`), only specified system calls are allowed; all other system calls are immediately blocked (`SIGSYS`).
+By default, Waterjail operates in a `blocklist` mode (allowing all syscalls except those explicitly blocked). For strict sandboxing, use the `allowlist` mode (`-t allowlist`), which drops all syscalls by default unless explicitly permitted.
 
-```sh
-# Allow only safe execution of mkdir
-./waterjail -t allowlist -a execve -a openat -a write -a mkdir -a exit_group -- mkdir test_dir
+---
+
+## Syscall Rule Definition
+
+Syscall rules are passed using the `-a` (allow), `-b` (block), or `-e` (block-errno) flags. 
+The format is: `<syscall_name>[:<arg_index><operator><value>]`
+
+### 1. Numeric and Bitwise Arguments (u64)
+System call arguments are evaluated as 64-bit integers. Supported operators are `==`, `!=`, `>=`, `>`, and `&` (bitwise AND). Values can be passed as decimal or hexadecimal (`0x`).
+
+*   **Block a specific file descriptor:**
+    Block the `write` syscall if the first argument (index 0) is exactly 1 (stdout).
+    ```bash
+    waterjail -b "write:0==1" -- my_app
+    ```
+*   **Evaluate bitwise flags:**
+    Allow `mprotect` only if the `PROT_EXEC` flag (value `4` or `0x4`) is not set.
+    ```bash
+    waterjail -t allowlist -a "mprotect:2&0x4" -- my_app
+    ```
+
+### 2. String Arguments (Regex)
+If the value is enclosed in double quotes and the `==` operator is used, Waterjail inspects the tracee's memory via `ptrace` and applies standard regular expressions.
+
+*   **Restrict file access by regex:**
+    Block `openat` if the path (index 1) matches a specific pattern.
+    ```bash
+    waterjail -b "openat:1==\"^/etc/shadow$\"" -- my_app
+    ```
+
+*Note: Waterjail implements TOCTOU (Time-Of-Check to Time-Of-Use) mitigation. If a blocked string argument is modified in memory between the syscall entry and exit, Waterjail neutralizes the operation (e.g., by injecting a `close()` or zeroing out the buffer).*
+
+---
+
+## Global Filtering (Paths and Strings)
+
+Writing per-syscall rules can be verbose. Waterjail provides global flags to apply filtering rules universally across relevant syscalls.
+
+### Path Filtering (`-P` and `-W`)
+These flags apply automatically to all known path-taking syscalls (e.g., `openat`, `unlinkat`, `mkdirat`, `statx`). They use **shell globbing** syntax (e.g., `*`, `?`), which the engine translates into regex internally.
+
+*   **Allow specific paths globally (blocks all other paths):**
+    ```bash
+    waterjail -W "/var/log/*.log" -W "/tmp/app_*" -- my_app
+    ```
+
+### String Filtering (`-B` and `-S`)
+These flags apply to *any* syscall that accepts a string pointer (e.g., `execve`, `mount`, `chdir`, `setxattr`). They expect **raw regular expressions** rather than globs.
+
+*   **Block any string input matching a regex pattern:**
+    ```bash
+    waterjail -B "^/bin/(sh|bash)$" -- my_app
+    ```
+
+---
+
+## Execution Phases and Timers
+
+Complex applications often require extensive system privileges during initialization (loading shared libraries, binding ports) but require minimal privileges during their main execution loop.
+
+*   `--setup-time <seconds>`: Defines the duration of the initialization phase.
+*   `--setup-only <syscall>`: Permits the specified syscall *only* during the setup time window. Once the timer expires, the syscall is blocked.
+*   `--runtime-time <seconds>`: Defines an overall timeout for the sandbox execution.
+
+**Example:**
+Allow `mmap` and `mprotect` for the first 3 seconds, but block them thereafter.
+```bash
+waterjail -t allowlist -a "read,write,mmap,mprotect" --setup-only "mmap" --setup-only "mprotect" --setup-time 3 -- my_app
 ```
 
-### Parameter Hardening Syntax
-`waterjail` supports precise argument filtering:
-```sh
-# Format: <syscall_name>:<arg_index><op><value>
-# Supported operators: ==, !=, >=, >, & (bitwise AND)
+---
 
-# Allow socket creation only if the domain (arg 0) is local Unix or IPv4
-./waterjail -t allowlist -a socket:0==1 -a socket:0==2 ... -- target_program
+## Automated Analysis Mode
+
+Waterjail can autonomously profile an application and generate a strict execution policy. By passing the `-A` (or `--analyze`) flag, the tool utilizes `strace` to monitor the target. 
+
+Upon completion, Waterjail outputs a `.sh` wrapper script containing a minimal, highly specific allowlist (including exact file paths, fixed memory addresses, and numeric ranges observed during the run).
+
+```bash
+# Profile the application with a 2-second setup phase assumption
+waterjail -A --setup-time 2 -- node server.js
+
+# Output will be generated as 'node.sh' in the current directory.
 ```
 
-### Advanced Bitwise Masking
-To block dangerous memory protections (like `PROT_EXEC` (4)) while allowing standard ones:
-```sh
-./waterjail -t allowlist -e "mprotect:2&18446744073709551608" -a mprotect -- target_program
-```
-*(Note: Always wrap bitwise filters containing `&` in double quotes to prevent bash from backgrounding the process).*
+---
+
+## Command-Line Options Reference
+
+| Flag | Long Flag | Description |
+| :--- | :--- | :--- |
+| `-b` | `--block` | Block a specific syscall. Format: `name` or `name:index<op>value`. |
+| `-e` | `--block-errno` | Block a syscall and return a specific errno instead of killing the process. |
+| `-a` | `--allow` | Allow a specific syscall. |
+| `-t` | `--type` | Base filter type: `allowlist` or `blocklist` (default: `blocklist`). |
+| | `--errno-code` | The integer error code returned when a syscall is blocked (default: 1). |
+| `-A` | `--analyze` | Run in profiling mode to generate a strict allowlist script. |
+| `-P` | `--block-path` | Globally block paths matching a glob pattern (applies to path syscalls). |
+| `-W` | `--allow-path` | Globally allow paths matching a glob pattern, blocking all others. |
+| `-B` | `--block-string`| Globally block strings matching a regex pattern (applies to all string args). |
+| `-S` | `--allow-string`| Globally allow strings matching a regex pattern, blocking all others. |
+| | `--setup-time` | Timer (in seconds) for the initialization phase. |
+| `-s` | `--setup-only` | A syscall allowed only during the setup timer period. |
+| | `--runtime-time` | Execution timeout (in seconds) for the sandboxed process. |
+
+---
 
 ## License
-![License: GPL v3](https://img.shields.io/badge/License-MIT-blue.svg)
+![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
