@@ -202,7 +202,7 @@ fn find_common_prefix(strings []string) string {
 }
 
 fn read_string_from_ptrace(pid int, addr u64) string {
-	mut res := []u8{}
+	mut sb := vanadium.sec_buf(4096) or { return '' }
 	mut current_addr := addr
 	for {
 		word := u64(C.ptrace(ptrace_peekdata, pid, i64(current_addr), 0))
@@ -214,21 +214,23 @@ fn read_string_from_ptrace(pid int, addr u64) string {
 				found_null = true
 				break
 			}
-			res << b[i]
+			sb.write_byte(b[i]) or { break }
 		}
 		if found_null {
 			break
 		}
-		current_addr += 8
-		if res.len > 4096 {
+		current_addr = vanadium.c_add(current_addr, u64(8)) or { break }
+		if sb.data.len > 4096 {
 			break
 		}
 	}
-	return res.bytestr()
+	res_str := (sb.read() or { []u8{} }).bytestr()
+	sb.clear()
+	return res_str
 }
 
 fn read_string_to_ijail(pid int, addr u64) !vanadium.IJail {
-	mut res := []u8{}
+	mut sb := vanadium.sec_buf(4096) or { return error('failed to create sec_buf') }
 	mut current_addr := addr
 	for {
 		word := u64(C.ptrace(ptrace_peekdata, pid, i64(current_addr), 0))
@@ -240,17 +242,19 @@ fn read_string_to_ijail(pid int, addr u64) !vanadium.IJail {
 				found_null = true
 				break
 			}
-			res << b[i]
+			sb.write_byte(b[i]) or { break }
 		}
 		if found_null {
 			break
 		}
-		current_addr += 8
-		if res.len > 4096 {
+		current_addr = vanadium.c_add(current_addr, u64(8)) or { break }
+		if sb.data.len > 4096 {
 			break
 		}
 	}
-	return vanadium.ijail(res.bytestr())
+	res_str := (sb.read() or { []u8{} }).bytestr()
+	sb.clear()
+	return vanadium.ijail(res_str)
 }
 
 fn inject_close(pid int, fd int) {
@@ -260,7 +264,8 @@ fn inject_close(pid int, fd int) {
 	saved_rip := C.ptrace(ptrace_peekuser, pid, rip_offset, 0)
 	C.ptrace(ptrace_pokeuser, pid, orig_rax_offset, i64(close_sys_nr))
 	C.ptrace(ptrace_pokeuser, pid, reg_offsets[0], i64(fd))
-	C.ptrace(ptrace_pokeuser, pid, rip_offset, saved_rip - syscall_size)
+	poke_rip := vanadium.c_sub[i64](saved_rip, i64(syscall_size)) or { saved_rip }
+	C.ptrace(ptrace_pokeuser, pid, rip_offset, poke_rip)
 	mut status := 0
 	C.ptrace(ptrace_syscall_op, pid, 0, 0)
 	C.waitpid(pid, &status, 0)
@@ -276,16 +281,20 @@ fn zero_tracee_memory(pid int, addr u64, len int) {
 		return
 	}
 	mut i := 0
-	for i <= len - 8 {
-		C.ptrace(ptrace_pokedata, pid, i64(addr + u64(i)), 0)
-		i += 8
+	limit := vanadium.c_sub(len, 8) or { return }
+	for i <= limit {
+		target_addr := vanadium.c_add(addr, u64(i)) or { break }
+		C.ptrace(ptrace_pokedata, pid, i64(target_addr), 0)
+		i = vanadium.c_add(i, 8) or { break }
 	}
 	if i < len {
-		remaining := len - i
-		mut word := u64(C.ptrace(ptrace_peekdata, pid, i64(addr + u64(i)), 0))
-		mask := ~((u64(1) << (remaining * 8)) - 1)
+		remaining := vanadium.c_sub(len, i) or { return }
+		target_addr := vanadium.c_add(addr, u64(i)) or { return }
+		mut word := u64(C.ptrace(ptrace_peekdata, pid, i64(target_addr), 0))
+		shift_val := vanadium.c_mul(remaining, 8) or { return }
+		mask := ~((u64(1) << shift_val) - 1)
 		word &= mask
-		C.ptrace(ptrace_pokedata, pid, i64(addr + u64(i)), i64(word))
+		C.ptrace(ptrace_pokedata, pid, i64(target_addr), i64(word))
 	}
 }
 
@@ -555,7 +564,7 @@ fn try_parse_flags(expr string) ?u64 {
 				}
 			}
 		}
-		total += val
+		total = vanadium.c_add(total, val) or { total }
 	}
 	return total
 }
