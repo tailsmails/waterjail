@@ -1106,34 +1106,50 @@ fn run_with_runtime_timer(
 						mut ij_path := read_string_to_ijail(current_pid, arg_ptr) or { continue }
 						defer { ij_path.free() }
 						ij_path.use(fn [p_actual_path_val, p_path_blocked, p_blocked_path_str, p_blocked_by_allowlist, mut compiled_block_paths_mut, mut compiled_allow_paths_mut] (p string) ! {
+							mut resolved := p
+							if os.is_link(p) {
+								resolved = os.real_path(p)
+								if resolved == '' {
+									resolved = p
+								}
+							}
 							unsafe {
 								*p_actual_path_val = p.clone()
 							}
-							for mut re in compiled_block_paths_mut {
-								start, end := re.match_string(p)
-								if start >= 0 && end >= start {
-									unsafe {
-										*p_path_blocked = true
-										*p_blocked_path_str = p
-									}
-									break
-								}
-							}
-							if !unsafe { *p_path_blocked } && compiled_allow_paths_mut.len > 0 {
-								mut is_allowed := false
+							mut matched_allow := false
+							if compiled_allow_paths_mut.len > 0 {
 								for mut re in compiled_allow_paths_mut {
-									start, end := re.match_string(p)
+									start, end := re.match_string(resolved)
 									if start >= 0 && end >= start {
-										is_allowed = true
+										matched_allow = true
 										break
 									}
 								}
-								if !is_allowed {
-									unsafe {
-										*p_path_blocked = true
-										*p_blocked_by_allowlist = true
-										*p_blocked_path_str = p
+							}
+							mut matched_block := false
+							if compiled_block_paths_mut.len > 0 {
+								for mut re in compiled_block_paths_mut {
+									start, end := re.match_string(resolved)
+									if start >= 0 && end >= start {
+										matched_block = true
+										break
 									}
+								}
+							}
+							if matched_allow {
+								unsafe {
+									*p_path_blocked = false
+								}
+							} else if matched_block {
+								unsafe {
+									*p_path_blocked = true
+									*p_blocked_path_str = resolved
+								}
+							} else if compiled_allow_paths_mut.len > 0 {
+								unsafe {
+									*p_path_blocked = true
+									*p_blocked_by_allowlist = true
+									*p_blocked_path_str = resolved
 								}
 							}
 							_ = p_actual_path_val
@@ -1327,7 +1343,6 @@ fn run_with_runtime_timer(
 		}
 	}
 }
-
 fn main() {
 	mut fp := flag.new_flag_parser(os.args)
 	fp.application('waterjail')
