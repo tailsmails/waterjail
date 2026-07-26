@@ -61,10 +61,11 @@ When multiple similar strings are observed for the same argument (e.g., `prctl` 
 
 ### Prerequisites
 
-To compile `waterjail` natively, you must first install the required Seccomp wrapper module for V:
+To compile `waterjail` natively, you must first install the required Seccomp wrapper module for V and Vanadium:
 
 ```sh
 v install --git https://github.com/tailsmails/vcomp
+v install --git https://github.com/tailsmails/vanadium
 ```
 
 ### Quick Start (Copy - Paste - Enter)
