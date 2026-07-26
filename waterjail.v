@@ -1143,13 +1143,13 @@ fn run_with_runtime_timer(
 							} else if matched_block {
 								unsafe {
 									*p_path_blocked = true
-									*p_blocked_path_str = resolved
+									*p_blocked_path_str = resolved.clone()
 								}
 							} else if compiled_allow_paths_mut.len > 0 {
 								unsafe {
 									*p_path_blocked = true
 									*p_blocked_by_allowlist = true
-									*p_blocked_path_str = resolved
+									*p_blocked_path_str = resolved.clone()
 								}
 							}
 							_ = p_actual_path_val
