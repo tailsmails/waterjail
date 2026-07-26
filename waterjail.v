@@ -6,6 +6,7 @@ import strconv
 import term
 import vcomp
 import regex
+import vanadium
 
 #include <sys/ptrace.h>
 #include <sys/wait.h>
@@ -130,11 +131,6 @@ struct DynamicRule {
 	u64_args []vcomp.ArgRule
 }
 
-struct RedirectedState {
-	orig_rsp u64
-	orig_reg_vals map[int]u64
-}
-
 fn resolve_syscall_num(sys_name string) !int {
 	nr := vcomp.get_syscall_number(sys_name) or {
 		return error('unknown syscall name: ${sys_name}')
@@ -231,25 +227,30 @@ fn read_string_from_ptrace(pid int, addr u64) string {
 	return res.bytestr()
 }
 
-fn write_string_to_ptrace(pid int, addr u64, s string) {
+fn read_string_to_ijail(pid int, addr u64) !vanadium.IJail {
+	mut res := []u8{}
 	mut current_addr := addr
-	mut i := 0
-	for i < s.len {
-		mut word := u64(0)
-		mut chunk_len := s.len - i
-		if chunk_len > 8 {
-			chunk_len = 8
+	for {
+		word := u64(C.ptrace(ptrace_peekdata, pid, i64(current_addr), 0))
+		mut b := [8]u8{}
+		unsafe { C.memcpy(&b[0], &word, 8) }
+		mut found_null := false
+		for i in 0 .. 8 {
+			if b[i] == 0 {
+				found_null = true
+				break
+			}
+			res << b[i]
 		}
-		unsafe {
-			C.memcpy(&word, s.str + i, chunk_len)
+		if found_null {
+			break
 		}
-		C.ptrace(ptrace_pokedata, pid, i64(current_addr), i64(word))
 		current_addr += 8
-		i += 8
+		if res.len > 4096 {
+			break
+		}
 	}
-	if s.len % 8 == 0 {
-		C.ptrace(ptrace_pokedata, pid, i64(current_addr), 0)
-	}
+	return vanadium.ijail(res.bytestr())
 }
 
 fn inject_close(pid int, fd int) {
@@ -353,7 +354,33 @@ fn match_dynamic_rule(rule DynamicRule, pid int, sys_nr int, mut checks []StrChe
 			reg_offset := reg_offsets[idx]
 			arg_ptr := u64(C.ptrace(ptrace_peekuser, pid, reg_offset, 0))
 			if arg_ptr < 0x10000 { return false, 'str arg[${idx}] has invalid pointer 0x${arg_ptr.hex()}' }
-			actual_str = read_string_from_ptrace(pid, arg_ptr)
+			
+			mut actual_str_val := ''
+			p_actual_str_val := &actual_str_val
+			mut matched_any := false
+			p_matched_any := &matched_any
+			mut allowed_res_mut := allowed_res.clone()
+			mut ij_str := read_string_to_ijail(pid, arg_ptr) or { return false, 'failed to secure string' }
+			defer { ij_str.free() }
+			ij_str.use(fn [p_actual_str_val, p_matched_any, mut allowed_res_mut] (s string) ! {
+				unsafe {
+					*p_actual_str_val = s.clone()
+				}
+				for mut re in allowed_res_mut {
+					start, end := re.match_string(s)
+					if start >= 0 && end >= start {
+						unsafe {
+							*p_matched_any = true
+						}
+						break
+					}
+				}
+			}) or { return false, 'secured execution failed' }
+			
+			if !matched_any {
+				return false, 'str arg[${idx}]="${actual_str}" did not match any pattern'
+			}
+			actual_str = actual_str_val
 			read_cache[idx] = actual_str
 			mut buf_ptr := u64(0)
 			mut buf_len := 0
@@ -372,17 +399,6 @@ fn match_dynamic_rule(rule DynamicRule, pid int, sys_nr int, mut checks []StrChe
 				buf_len = 256
 			}
 			checks << StrCheckData{arg_ptr, actual_str, sys_nr, buf_ptr, buf_len}
-		}
-		mut matched_any := false
-		for re in allowed_res {
-			start, end := re.match_string(actual_str)
-			if start >= 0 && end >= start {
-				matched_any = true
-				break
-			}
-		}
-		if !matched_any {
-			return false, 'str arg[${idx}]="${actual_str}" did not match any pattern'
 		}
 	}
 	return true, 'matched all conditions'
@@ -462,7 +478,7 @@ fn has_digits_or_letters(s string) bool {
 			return true
 		}
 	}
-	return false
+	return true
 }
 
 fn extract_return_value(line string) ?u64 {
@@ -739,7 +755,6 @@ fn run_with_runtime_timer(
 	dynamic_block_rules := build_dynamic_rules_map(blocks)
 	dynamic_block_errno_rules := build_dynamic_rules_map(block_errnos)
 	mut str_check_map := map[int][]StrCheckData{}
-	mut redirected_map := map[int]RedirectedState{}
 
 	mut path_arg_indices := map[int][]int{}
 	mut compiled_block_paths := []regex.RE{}
@@ -779,11 +794,11 @@ fn run_with_runtime_timer(
 		}
 	}
 
-	mut string_arg_indices := map[int][]int{}
 	mut compiled_block_strings := []regex.RE{}
 	mut compiled_allow_strings := []regex.RE{}
 
 	if block_strings.len > 0 || allow_strings.len > 0 {
+		mut string_arg_indices := map[int][]int{}
 		str_arg_defs := {
 			'open': [0], 'openat': [1], 'execve': [0], 'execveat': [1],
 			'chdir': [0], 'chroot': [0], 'access': [0], 'faccessat': [1],
@@ -936,7 +951,6 @@ fn run_with_runtime_timer(
 			is_enter_map.delete(current_pid)
 			blocked_this_map.delete(current_pid)
 			str_check_map.delete(current_pid)
-			redirected_map.delete(current_pid)
 			continue
 		}
 		if (status & 0xff) != 0x7f {
@@ -946,7 +960,6 @@ fn run_with_runtime_timer(
 			is_enter_map.delete(current_pid)
 			blocked_this_map.delete(current_pid)
 			str_check_map.delete(current_pid)
-			redirected_map.delete(current_pid)
 			continue
 		}
 
@@ -1073,33 +1086,55 @@ fn run_with_runtime_timer(
 					if idx in read_cache {
 						actual_path = read_cache[idx]
 					} else {
-						actual_path = read_string_from_ptrace(current_pid, arg_ptr)
+						mut actual_path_val := ''
+						p_actual_path_val := &actual_path_val
+						p_path_blocked := &path_blocked
+						p_blocked_path_str := &blocked_path_str
+						p_blocked_by_allowlist := &blocked_by_allowlist
+						mut compiled_block_paths_mut := compiled_block_paths.clone()
+						mut compiled_allow_paths_mut := compiled_allow_paths.clone()
+
+						mut ij_path := read_string_to_ijail(current_pid, arg_ptr) or { continue }
+						defer { ij_path.free() }
+						ij_path.use(fn [p_actual_path_val, p_path_blocked, p_blocked_path_str, p_blocked_by_allowlist, mut compiled_block_paths_mut, mut compiled_allow_paths_mut] (p string) ! {
+							unsafe {
+								*p_actual_path_val = p.clone()
+							}
+							for mut re in compiled_block_paths_mut {
+								start, end := re.match_string(p)
+								if start >= 0 && end >= start {
+									unsafe {
+										*p_path_blocked = true
+										*p_blocked_path_str = p
+									}
+									break
+								}
+							}
+							if !unsafe { *p_path_blocked } && compiled_allow_paths_mut.len > 0 {
+								mut is_allowed := false
+								for mut re in compiled_allow_paths_mut {
+									start, end := re.match_string(p)
+									if start >= 0 && end >= start {
+										is_allowed = true
+										break
+									}
+								}
+								if !is_allowed {
+									unsafe {
+										*p_path_blocked = true
+										*p_blocked_by_allowlist = true
+										*p_blocked_path_str = p
+									}
+								}
+							}
+							_ = p_actual_path_val
+							_ = p_path_blocked
+							_ = p_blocked_path_str
+							_ = p_blocked_by_allowlist
+						}) or { continue }
+						actual_path = actual_path_val
 						read_cache[idx] = actual_path
 						checks << StrCheckData{arg_ptr, actual_path, sys_nr, u64(0), 0}
-					}
-					for re in compiled_block_paths {
-						start, end := re.match_string(actual_path)
-						if start >= 0 && end >= start {
-							path_blocked = true
-							blocked_path_str = actual_path
-							break
-						}
-					}
-					if path_blocked { break }
-					if compiled_allow_paths.len > 0 && !path_blocked {
-						mut is_allowed := false
-						for re in compiled_allow_paths {
-							start, end := re.match_string(actual_path)
-							if start >= 0 && end >= start {
-								is_allowed = true
-								break
-							}
-						}
-						if !is_allowed {
-							path_blocked = true
-							blocked_by_allowlist = true
-							blocked_path_str = actual_path
-						}
 					}
 				}
 			}
@@ -1108,42 +1143,88 @@ fn run_with_runtime_timer(
 			mut blocked_string_val := ''
 			mut str_blocked_by_allowlist := false
 
-			if (compiled_block_strings.len > 0 || compiled_allow_strings.len > 0) && sys_nr in string_arg_indices {
-				for idx in string_arg_indices[sys_nr] {
-					if idx >= reg_offsets.len { continue }
-					reg_offset := reg_offsets[idx]
-					arg_ptr := u64(C.ptrace(ptrace_peekuser, current_pid, reg_offset, 0))
-					if arg_ptr < 0x10000 { continue }
-					mut actual_str := ''
-					if idx in read_cache {
-						actual_str = read_cache[idx]
-					} else {
-						actual_str = read_string_from_ptrace(current_pid, arg_ptr)
-						read_cache[idx] = actual_str
-						checks << StrCheckData{arg_ptr, actual_str, sys_nr, u64(0), 0}
-					}
-					for re in compiled_block_strings {
-						start, end := re.match_string(actual_str)
-						if start >= 0 && end >= start {
-							string_blocked = true
-							blocked_string_val = actual_str
-							break
-						}
-					}
-					if string_blocked { break }
-					if compiled_allow_strings.len > 0 && !string_blocked {
-						mut is_allowed := false
-						for re in compiled_allow_strings {
-							start, end := re.match_string(actual_str)
-							if start >= 0 && end >= start {
-								is_allowed = true
-								break
-							}
-						}
-						if !is_allowed {
-							string_blocked = true
-							str_blocked_by_allowlist = true
-							blocked_string_val = actual_str
+			mut mut_block_strings := compiled_block_strings.clone()
+			mut mut_allow_strings := compiled_allow_strings.clone()
+
+			if mut_block_strings.len > 0 || mut_allow_strings.len > 0 {
+				mut string_arg_indices := map[int][]int{}
+				str_arg_defs := {
+					'open': [0], 'openat': [1], 'execve': [0], 'execveat': [1],
+					'chdir': [0], 'chroot': [0], 'access': [0], 'faccessat': [1],
+					'stat': [0], 'lstat': [0], 'newfstatat': [1], 'statx': [1],
+					'chmod': [0], 'fchmodat': [1], 'chown': [0], 'lchown': [0], 'fchownat': [1],
+					'unlink': [0], 'unlinkat': [1], 'rmdir': [0], 'mkdir': [0], 'mkdirat': [1],
+					'rename': [0, 1], 'renameat': [1, 3], 'renameat2': [1, 3],
+					'link': [0, 1], 'linkat': [1, 3], 'symlink': [0, 1], 'symlinkat': [0, 2],
+					'readlink': [0], 'readlinkat': [1], 'truncate': [0],
+					'mount': [0, 1, 2], 'umount2': [0], 'pivot_root': [0, 1],
+					'setxattr': [0, 1], 'lsetxattr': [0, 1], 'fsetxattr': [1],
+					'getxattr': [0, 1], 'lgetxattr': [0, 1], 'fgetxattr': [1],
+					'removexattr': [0], 'lremovexattr': [0], 'fremovexattr': [1],
+					'acct': [0], 'swapon': [0], 'swapoff': [0], 'quotactl': [1],
+					'init_module': [0], 'finit_module': [1]
+				}
+				for name, idxs in str_arg_defs {
+					nr := resolve_syscall_num(name) or { continue }
+					string_arg_indices[int(nr)] = idxs
+				}
+				if sys_nr in string_arg_indices {
+					for idx in string_arg_indices[sys_nr] {
+						if idx >= reg_offsets.len { continue }
+						reg_offset := reg_offsets[idx]
+						arg_ptr := u64(C.ptrace(ptrace_peekuser, current_pid, reg_offset, 0))
+						if arg_ptr < 0x10000 { continue }
+						mut actual_str := ''
+						if idx in read_cache {
+							actual_str = read_cache[idx]
+						} else {
+							mut actual_str_val := ''
+							p_actual_str_val := &actual_str_val
+							p_string_blocked := &string_blocked
+							p_blocked_string_val := &blocked_string_val
+							p_str_blocked_by_allowlist := &str_blocked_by_allowlist
+
+							mut ij_str := read_string_to_ijail(current_pid, arg_ptr) or { continue }
+							defer { ij_str.free() }
+							ij_str.use(fn [p_actual_str_val, p_string_blocked, p_blocked_string_val, p_str_blocked_by_allowlist, mut mut_block_strings, mut mut_allow_strings] (s string) ! {
+								unsafe {
+									*p_actual_str_val = s.clone()
+								}
+								for mut re in mut_block_strings {
+									start, end := re.match_string(s)
+									if start >= 0 && end >= start {
+										unsafe {
+											*p_string_blocked = true
+											*p_blocked_string_val = s
+										}
+										break
+									}
+								}
+								if !unsafe { *p_string_blocked } && mut_allow_strings.len > 0 {
+									mut is_allowed := false
+									for mut re in mut_allow_strings {
+										start, end := re.match_string(s)
+										if start >= 0 && end >= start {
+											is_allowed = true
+											break
+										}
+									}
+									if !is_allowed {
+										unsafe {
+											*p_string_blocked = true
+											*p_str_blocked_by_allowlist = true
+											*p_blocked_string_val = s
+										}
+									}
+								}
+								_ = p_actual_str_val
+								_ = p_string_blocked
+								_ = p_blocked_string_val
+								_ = p_str_blocked_by_allowlist
+							}) or { continue }
+							actual_str = actual_str_val
+							read_cache[idx] = actual_str
+							checks << StrCheckData{arg_ptr, actual_str, sys_nr, u64(0), 0}
 						}
 					}
 				}
@@ -1186,68 +1267,38 @@ fn run_with_runtime_timer(
 				eprintln('[ptrace] Blocked syscall "${sys_name_str}" (sys=${sys_nr}) pid=${current_pid} | Reason: ${block_reason}')
 				C.ptrace(ptrace_pokeuser, current_pid, orig_rax_offset, -1)
 				blocked_this_map[current_pid] = true
-			} else if read_cache.len > 0 {
-				orig_rsp := u64(C.ptrace(ptrace_peekuser, current_pid, rsp_offset, 0))
-				mut orig_reg_vals := map[int]u64{}
-				
-				mut offset := u64(2048)
-				for idx, actual_str in read_cache {
-					if idx >= reg_offsets.len { continue }
-					reg_offset := reg_offsets[idx]
-					orig_val := u64(C.ptrace(ptrace_peekuser, current_pid, reg_offset, 0))
-					orig_reg_vals[reg_offset] = orig_val
-					
-					target_addr := orig_rsp - offset
-					write_string_to_ptrace(current_pid, target_addr, actual_str)
-					
-					C.ptrace(ptrace_pokeuser, current_pid, reg_offset, i64(target_addr))
-					offset += 1024
-				}
-				C.ptrace(ptrace_pokeuser, current_pid, rsp_offset, i64(orig_rsp - offset))
-				
-				redirected_map[current_pid] = RedirectedState{
-					orig_rsp: orig_rsp
-					orig_reg_vals: orig_reg_vals
-				}
 			}
 
 			str_check_map[current_pid] = checks
 			is_enter_map[current_pid] = false
 		} else {
 			sys_ret := C.ptrace(ptrace_peekuser, current_pid, rax_offset, 0)
-			
-			if current_pid in redirected_map {
-				state := redirected_map[current_pid]
-				C.ptrace(ptrace_pokeuser, current_pid, rsp_offset, i64(state.orig_rsp))
-				for reg_offset, orig_val in state.orig_reg_vals {
-					C.ptrace(ptrace_pokeuser, current_pid, reg_offset, i64(orig_val))
-				}
-				redirected_map.delete(current_pid)
-			}
-
 			if current_pid in str_check_map {
 				checks := str_check_map[current_pid]
 				mut toctou_detected := false
 				if sys_ret >= 0 {
 					for chk in checks {
-						actual_str_exit := read_string_from_ptrace(current_pid, chk.ptr)
+						mut ij_str := read_string_to_ijail(current_pid, chk.ptr) or { continue }
+						defer { ij_str.free() }
+						mut actual_str_exit := ''
+						p_actual_str_exit := &actual_str_exit
+						ij_str.use(fn [p_actual_str_exit] (s string) ! {
+							unsafe {
+								*p_actual_str_exit = s.clone()
+							}
+							_ = p_actual_str_exit
+						}) or { continue }
 						if actual_str_exit != chk.orig {
 							toctou_detected = true
-							sys_open := resolve_syscall_num('open') or { 2 }
-							sys_openat := resolve_syscall_num('openat') or { 257 }
-							sys_getcwd := resolve_syscall_num('getcwd') or { 89 }
-							sys_readlink := resolve_syscall_num('readlink') or { 106 }
-							sys_readlinkat := resolve_syscall_num('readlinkat') or { 107 }
-							
-							if chk.sys_nr == sys_openat || chk.sys_nr == sys_open {
+							if chk.sys_nr == 257 || chk.sys_nr == 2 {
 								inject_close(current_pid, int(sys_ret))
-							} else if chk.sys_nr == sys_getcwd {
+							} else if chk.sys_nr == 89 {
 								mut actual_len := int(sys_ret)
 								if actual_len > chk.buf_len {
 									actual_len = chk.buf_len
 								}
 								zero_tracee_memory(current_pid, chk.buf_ptr, actual_len)
-							} else if chk.sys_nr == sys_readlink || chk.sys_nr == sys_readlinkat {
+							} else if chk.sys_nr == 106 || chk.sys_nr == 107 || chk.sys_nr == 262 {
 								zero_tracee_memory(current_pid, chk.buf_ptr, 256)
 							}
 							break
@@ -1424,7 +1475,7 @@ fn main() {
 				sys_parts := before_paren.split(' ')
 				sys_name := sys_parts.last().trim_space()
 				if is_valid_syscall_name(sys_name) && sys_name !in dangerous_syscalls {
-					_ := resolve_syscall_num(sys_name) or { continue }
+					_ := vcomp.get_syscall_number(sys_name) or { continue }
 					if sys_name !in unique_syscalls {
 						unique_syscalls << sys_name
 					}
