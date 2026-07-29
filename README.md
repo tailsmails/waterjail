@@ -209,4 +209,4 @@ waterjail -A --setup-time 2 -- node server.js
 ---
 
 ## License
-![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
+![License](https://img.shields.io/badge/License-EUPL1.2-blue.svg)
