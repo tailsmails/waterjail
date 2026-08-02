@@ -21,7 +21,7 @@ struct C.timeval {
 }
 
 fn C.fork() int
-fn C.ptrace(request int, pid int, addr i64, data i64) i64
+// fn C.ptrace(request int, pid int, addr i64, data i64) i64
 fn C.waitpid(pid int, status &int, options int) int
 fn C.gettimeofday(tv &C.timeval, tz voidptr) int
 fn C._exit(status int)
