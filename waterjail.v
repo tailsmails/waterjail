@@ -29,7 +29,7 @@ fn C.alarm(seconds u32) u32
 fn C.signal(signum int, handler voidptr) voidptr
 fn C.memcpy(dest voidptr, src voidptr, n usize) voidptr
 fn C.__errno_location() &int
-fn C.prctl(option int, arg2 int, arg3 int, arg4 int, arg5 int) int
+// fn C.prctl(option int, arg2 int, arg3 int, arg4 int, arg5 int) int
 
 fn get_errno() int {
 	return unsafe { *C.__errno_location() }
