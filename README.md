@@ -1,59 +1,51 @@
 # waterjail
 
-A lightweight, surgical Seccomp-BPF dynamic sandboxing and analysis tool written in V.
+A Seccomp-BPF and ptrace-based dynamic sandboxing and analysis tool written in V.
 
-### ⚠️ Not a Firejail Replacement
-`waterjail` is **not** a replacement for full-featured namespace sandboxes like `firejail`. Firejail is a massive, multi-layered sandbox utilizing mount namespaces, user namespaces, cgroups, network isolation, and chroot environments. 
+### Scope and Limitations
+`waterjail` is not a replacement for full-featured namespace sandboxes like `firejail`. Tools like Firejail utilize mount namespaces, user namespaces, cgroups, network isolation, and chroot environments to provide broad system isolation. 
 
-Instead, `waterjail` is a specialized **complementary utility**. It focuses purely on dynamic Seccomp-BPF auditing, parameter-level system call filtering, and deep memory inspection. You can use it as a standalone lightweight wrapper, or to dynamically generate strictly minimal Seccomp filters to supplement other virtualization or containment tools.
+`waterjail` is a specialized utility focused on dynamic Seccomp-BPF auditing, parameter-level system call filtering, and process memory inspection. It can be used as a standalone wrapper or to generate strict Seccomp filters to supplement other virtualization tools.
 
 ---
 
 ## Core Capabilities
 
-- **Dynamic Analysis Mode (`-A`)**: Runs your target application under `strace`, monitors its behavior, and automatically generates an executable hardened shell script containing the strict Seccomp allowlist.
-- **Dynamic Bitmask Hardener (W^X Safety)**: Automatically analyzes memory allocation systems (`mprotect` and `mmap`) to build a unified safe bitmask. It blocks memory executions outside the application's actual dynamic JIT compiler runtime limits, effectively killing classic shellcode execution.
-- **Safe Fallback Engine**: If any complex or unresolved system-level flag constant (like raw `ioctl` commands, `fcntl` flags, or namespace clone flags) is captured but cannot be verified, the parser automatically falls back to an unconditional allow rule for that specific syscall rather than generating a broken rule that crashes the application.
+- **Analysis Mode (`-A`)**: Runs the target application under `strace`, logs its behavior, and generates an executable shell script containing a strict Seccomp allowlist based on the observed execution profile.
+- **Dynamic Bitmask Generation**: Analyzes memory allocation syscalls (e.g., `mprotect` and `mmap`) during profiling to build a unified bitmask. This restricts memory execution rights to the application's observed requirements, mitigating unauthorized execution in memory.
+- **Parser Fallback Handling**: If unresolved system-level flag constants (such as raw `ioctl` commands or namespace clone flags) are captured during profiling, the parser defaults to a broad allow rule for that specific syscall to maintain target application stability.
 
 ---
 
-## The Hybrid Engine: Seccomp + ptrace
+## Architecture: Seccomp + ptrace
 
-Historically, `seccomp` BPF filters could only inspect numeric syscall arguments. A syscall like `openat` takes a pointer to a string (the file path), which BPF cannot dereference. 
+Standard `seccomp` BPF filters evaluate numeric syscall arguments but cannot dereference pointers (such as a file path string passed to `openat`). `waterjail` utilizes a hybrid `seccomp` and `ptrace` architecture to inspect pointer arguments and control execution phases.
 
-`waterjail` bridges this gap using a hybrid `seccomp` + `ptrace` architecture to provide deep argument inspection and time-aware execution control.
-
-### Dynamic String Argument Filtering
-1. **Analysis Mode**: When running with `-A`, `waterjail` detects string arguments in syscalls (e.g., `openat(AT_FDCWD, "/etc/hosts", ...)`). If the application uses a stable set of strings, it generates rules like `-a openat:1=="/etc/hosts"`.
-2. **Execution Mode**: Because `seccomp` cannot evaluate string rules, `waterjail` automatically falls back to `ptrace` interception when string rules are present. It intercepts the syscall, reads the process memory at the argument pointer using `PTRACE_PEEKDATA`, extracts the string, and validates it against the allowlist. If it doesn't match, the syscall is blocked and `EPERM` is returned.
-3. **TOCTOU Neutralization (Check-and-Undo)**: A known architectural limitation of userspace `ptrace` interception is the TOCTOU (Time-of-Check to Time-of-Use) race condition. `waterjail` mitigates this by re-validating the string at syscall exit. If a race condition is detected (the path was swapped just before the kernel executed it), `waterjail` actively neutralizes the attack: it injects a `close()` syscall to kill the illegally opened File Descriptor, or zeroes out the memory buffer before returning `EPERM` to the process. The attacker wins the race, but the payload is destroyed.
+### String Argument Filtering
+1. **Analysis Phase**: When executed with `-A`, `waterjail` logs string arguments in syscalls. If consistent strings are observed, it generates corresponding rules (e.g., `-a openat:1=="/etc/hosts"`).
+2. **Execution Phase**: Because `seccomp` cannot evaluate strings, `waterjail` uses `ptrace` when string rules are defined. It intercepts the syscall, reads the process memory at the argument pointer via `PTRACE_PEEKDATA`, and validates the extracted string against the defined regex patterns. Unmatched syscalls return `EPERM`.
+3. **TOCTOU Mitigation**: To address the Time-of-Check to Time-of-Use race condition inherent in userspace `ptrace` implementations, `waterjail` re-validates strings at syscall exit. If a memory modification is detected between entry and exit, the operation is neutralized (e.g., by injecting a `close()` syscall for the opened file descriptor or zeroing the memory buffer) before returning an error to the process.
 
 ### Time-Aware Sandboxing
-Complex apps often need privileged syscalls (`chroot`, `vfork`) only during setup. The analyzer detects these and flags them as `--setup-only`.
-- **`--setup-time <s>`**: Used in analysis mode to categorize syscalls only observed in the first `<s>` seconds as setup-only.
-- **`--runtime-time <s>`**: Uses `ptrace` to allow setup-only syscalls for `<s>` seconds, then dynamically blocks them by altering process registers.
+Applications often require privileged syscalls during initialization that are unnecessary during their main execution loop.
+- **`--setup-time <s>`**: Used during analysis to categorize syscalls observed only in the first `<s>` seconds as setup-specific.
+- **`--runtime-time <s>`**: Uses `ptrace` to permit setup-only syscalls for `<s>` seconds. Once the timer expires, these syscalls are blocked. 
 
-To prevent a malicious process from keeping the tracer idle to bypass the timer, `waterjail` utilizes kernel-level `SIGALRM` via `alarm()`, ensuring phase transitions occur exactly on time regardless of process activity.
+Transitions between phases are enforced using the kernel-level `SIGALRM` via `alarm()`, ensuring timers are respected regardless of the tracee's execution state.
 
 ---
 
-## Smart Profiling & Stability
+## Profiling Logic
 
-Securing massive, multi-threaded applications (like web browsers) requires an analyzer that understands application behavior, rather than blindly blocking anything it hasn't seen before.
+To maintain stability when profiling complex applications, the analyzer implements specific behavioral exemptions:
 
-### Intelligent I/O Tracking
-Event-driven I/O syscalls (like `accept4`, `bind`, `listen`, or `read` on specific sockets) might not occur during the initial observation phase. Naively categorizing these as "setup-only" causes crashes when the application later needs them to handle new network traffic.
+### I/O Tracking
+Event-driven I/O syscalls (e.g., `accept4`, `bind`, `read` on dynamic sockets) may not trigger during the initial setup observation window. To prevent runtime crashes, `waterjail` tracks file descriptors. Syscalls operating on these descriptors are excluded from the `--setup-only` categorization. 
 
-`waterjail` tracks file descriptors returned by syscalls (e.g., sockets, pipes, event files). Any syscall that operates on these tracked FDs is dynamically identified as an I/O operation and excluded from the `--setup-only` list, ensuring event-driven applications can handle future traffic without crashing.
+Additionally, syscalls querying core system information via a single pointer argument (e.g., `uname`) and internal mechanisms like `restart_syscall` are explicitly exempted from setup-only blocking.
 
-Additionally, syscalls that query core system information using a single pointer argument (like `uname`) are exempted from setup-only blocking, preventing crashes from unpredictable standard library queries (e.g., DNS resolution). The internal kernel mechanism `restart_syscall` is also explicitly exempted.
-
-### Wildcard String Generation
-When multiple similar strings are observed for the same argument (e.g., `prctl` setting memory names like `"jemalloc"` and `"jemalloc-decommitted"`), the analyzer finds the common prefix and generates a single wildcard rule (e.g., `-a 'prctl:4=="jemalloc*"'`). The runtime `ptrace` interceptor supports suffix wildcard matching, allowing related dynamic strings to pass the filter without disabling the rule entirely.
-
-### Multi-threaded Architecture Fixes
-- **`ptrace` State Desync Fix**: Fixed a critical issue where a `SIGALRM` interrupt during `waitpid` could desynchronize the `ptrace` syscall tracking state. The tracer now correctly preserves the entry/exit state across signal interrupts.
-- **Thread Entry/Exit Tracking**: Fixed a race condition where `SIGSTOP` in running threads could cause the entry/exit state map to become corrupted, leading to invalid register reads and immediate process termination.
+### Wildcard Generation
+When multiple similar strings are captured for a single argument (e.g., `prctl` thread names), the analyzer identifies the common prefix and generates a unified wildcard rule (e.g., `-a 'prctl:4=="jemalloc*"'`). The `ptrace` interceptor processes these using regex.
 
 ---
 
@@ -61,7 +53,7 @@ When multiple similar strings are observed for the same argument (e.g., `prctl` 
 
 ### Prerequisites
 
-To compile `waterjail` natively, you must first install the required Seccomp wrapper module for V and Vanadium:
+To compile `waterjail` natively, the required Seccomp and memory handling modules must be installed:
 
 ```sh
 v install --git https://github.com/tailsmails/vcomp
@@ -70,112 +62,86 @@ v install --git https://github.com/tailsmails/vanadium
 
 ---
 
-# Usage
-Here is a professional, technically accurate, and native-English README block tailored for standard GitHub documentation or a man page. It contains no emojis, promotional language, or subjective claims, focusing purely on usage and architecture.
+## Usage
 
-## Table of Contents
-1. [Basic Syntax](#basic-syntax)
-2. [Syscall Rule Definition](#syscall-rule-definition)
-3. [Global Filtering (Paths and Strings)](#global-filtering-paths-and-strings)
-4. [Execution Phases and Timers](#execution-phases-and-timers)
-5. [Automated Analysis Mode](#automated-analysis-mode)
-6. [Command-Line Options Reference](#command-line-options-reference)
+### Basic Syntax
 
----
-
-## Basic Syntax
-
-The standard invocation requires specifying the filter type, the associated rules, and the target application:
+The tool requires specifying a filter type, the associated rules, and the target application:
 
 ```bash
 waterjail [OPTIONS] -- <target_command> [args...]
 ```
 
-By default, Waterjail operates in a `blocklist` mode (allowing all syscalls except those explicitly blocked). For strict sandboxing, use the `allowlist` mode (`-t allowlist`), which drops all syscalls by default unless explicitly permitted.
+By default, `waterjail` uses a `blocklist` mode. For strict sandboxing, use the `allowlist` mode (`-t allowlist`), which drops all syscalls by default unless explicitly permitted by a rule.
 
----
+### Syscall Rule Definition
 
-## Syscall Rule Definition
+Rules are passed using `-a` (allow), `-b` (block), or `-e` (block-errno). 
+Format: `<syscall_name>[:<arg_index><operator><value>]`
 
-Syscall rules are passed using the `-a` (allow), `-b` (block), or `-e` (block-errno) flags. 
-The format is: `<syscall_name>[:<arg_index><operator><value>]`
+#### 1. Numeric and Bitwise Arguments (u64)
+Arguments are evaluated as 64-bit integers. Supported operators: `==`, `!=`, `>=`, `>`, and `&` (bitwise AND). Values are accepted in decimal or hexadecimal (`0x`).
 
-### 1. Numeric and Bitwise Arguments (u64)
-System call arguments are evaluated as 64-bit integers. Supported operators are `==`, `!=`, `>=`, `>`, and `&` (bitwise AND). Values can be passed as decimal or hexadecimal (`0x`).
-
-*   **Block a specific file descriptor:**
-    Block the `write` syscall if the first argument (index 0) is exactly 1 (stdout).
+*   **Block a specific value:**
+    Block `write` if the first argument (index 0) is 1.
     ```bash
     waterjail -b "write:0==1" -- my_app
     ```
 *   **Evaluate bitwise flags:**
-    Allow `mprotect` only if the `PROT_EXEC` flag (value `4` or `0x4`) is not set.
+    Allow `mprotect` only if the `PROT_EXEC` flag (value `4`) is not set.
     ```bash
     waterjail -t allowlist -a "mprotect:2&0x4" -- my_app
     ```
 
-### 2. String Arguments (Regex)
-If the value is enclosed in double quotes and the `==` operator is used, Waterjail inspects the tracee's memory via `ptrace` and applies standard regular expressions.
+#### 2. String Arguments (Regex)
+If the value is enclosed in double quotes with the `==` operator, the engine inspects the memory via `ptrace` and evaluates the string using standard regular expressions.
 
-*   **Restrict file access by regex:**
-    Block `openat` if the path (index 1) matches a specific pattern.
+*   **Restrict access by regex:**
+    Block `openat` if the path (index 1) matches the exact string `/etc/shadow`.
     ```bash
     waterjail -b "openat:1==\"^/etc/shadow$\"" -- my_app
     ```
 
-*Note: Waterjail implements TOCTOU (Time-Of-Check to Time-Of-Use) mitigation. If a blocked string argument is modified in memory between the syscall entry and exit, Waterjail neutralizes the operation (e.g., by injecting a `close()` or zeroing out the buffer).*
+### Global Filtering
 
----
+Global flags apply rules universally across specific categories of syscalls.
 
-## Global Filtering (Paths and Strings)
+#### Path Filtering (`-P` and `-W`)
+Applies to all path-taking syscalls (e.g., `openat`, `unlinkat`, `mkdirat`). These flags use shell globbing syntax (`*`, `?`), which is internally converted to regex.
 
-Writing per-syscall rules can be verbose. Waterjail provides global flags to apply filtering rules universally across relevant syscalls.
-
-### Path Filtering (`-P` and `-W`)
-These flags apply automatically to all known path-taking syscalls (e.g., `openat`, `unlinkat`, `mkdirat`, `statx`). They use **shell globbing** syntax (e.g., `*`, `?`), which the engine translates into regex internally.
-
-*   **Allow specific paths globally (blocks all other paths):**
+*   **Allow specific paths (blocks all others):**
     ```bash
     waterjail -W "/var/log/*.log" -W "/tmp/app_*" -- my_app
     ```
 
-### String Filtering (`-B` and `-S`)
-These flags apply to *any* syscall that accepts a string pointer (e.g., `execve`, `mount`, `chdir`, `setxattr`). They expect **raw regular expressions** rather than globs.
+#### String Filtering (`-B` and `-S`)
+Applies to any syscall accepting a string pointer (e.g., `execve`, `mount`, `chdir`). These flags expect standard regular expressions.
 
-*   **Block any string input matching a regex pattern:**
+*   **Block string input matching a pattern:**
     ```bash
     waterjail -B "^/bin/(sh|bash)$" -- my_app
     ```
 
----
+### Execution Phases and Timers
 
-## Execution Phases and Timers
+*   `--setup-time <seconds>`: Sets the duration of the initialization phase.
+*   `--setup-only <syscall>`: Permits the specified syscall exclusively during the setup time window.
+*   `--runtime-time <seconds>`: Sets an execution timeout for the sandboxed process.
 
-Complex applications often require extensive system privileges during initialization (loading shared libraries, binding ports) but require minimal privileges during their main execution loop.
-
-*   `--setup-time <seconds>`: Defines the duration of the initialization phase.
-*   `--setup-only <syscall>`: Permits the specified syscall *only* during the setup time window. Once the timer expires, the syscall is blocked.
-*   `--runtime-time <seconds>`: Defines an overall timeout for the sandbox execution.
-
-**Example:**
-Allow `mmap` and `mprotect` for the first 3 seconds, but block them thereafter.
+**Example:** Allow `mmap` and `mprotect` for the first 3 seconds only.
 ```bash
 waterjail -t allowlist -a "read,write,mmap,mprotect" --setup-only "mmap" --setup-only "mprotect" --setup-time 3 -- my_app
 ```
 
----
+### Automated Analysis Mode
 
-## Automated Analysis Mode
-
-Waterjail can autonomously profile an application and generate a strict execution policy. By passing the `-A` (or `--analyze`) flag, the tool utilizes `strace` to monitor the target. 
-
-Upon completion, Waterjail outputs a `.sh` wrapper script containing a minimal, highly specific allowlist (including exact file paths, fixed memory addresses, and numeric ranges observed during the run).
+Passing the `-A` (or `--analyze`) flag runs the application under `strace` to monitor its behavior. `waterjail` then generates a `.sh` wrapper script containing the computed allowlist (including file paths, memory addresses, and numeric ranges).
 
 ```bash
-# Profile the application with a 2-second setup phase assumption
+# Profile the application with a 2-second setup phase
 waterjail -A --setup-time 2 -- node server.js
 
-# Output will be generated as 'node.sh' in the current directory.
+# Generates 'node.sh' in the current directory.
 ```
 
 ---
@@ -185,17 +151,17 @@ waterjail -A --setup-time 2 -- node server.js
 | Flag | Long Flag | Description |
 | :--- | :--- | :--- |
 | `-b` | `--block` | Block a specific syscall. Format: `name` or `name:index<op>value`. |
-| `-e` | `--block-errno` | Block a syscall and return a specific errno instead of killing the process. |
+| `-e` | `--block-errno` | Block a syscall and return a specific errno instead of terminating the process. |
 | `-a` | `--allow` | Allow a specific syscall. |
 | `-t` | `--type` | Base filter type: `allowlist` or `blocklist` (default: `blocklist`). |
 | | `--errno-code` | The integer error code returned when a syscall is blocked (default: 1). |
-| `-A` | `--analyze` | Run in profiling mode to generate a strict allowlist script. |
-| `-P` | `--block-path` | Globally block paths matching a glob pattern (applies to path syscalls). |
+| `-A` | `--analyze` | Run in profiling mode to generate a strict allowlist shell script. |
+| `-P` | `--block-path` | Globally block paths matching a glob pattern (applies to path-taking syscalls). |
 | `-W` | `--allow-path` | Globally allow paths matching a glob pattern, blocking all others. |
 | `-B` | `--block-string`| Globally block strings matching a regex pattern (applies to all string args). |
 | `-S` | `--allow-string`| Globally allow strings matching a regex pattern, blocking all others. |
 | | `--setup-time` | Timer (in seconds) for the initialization phase. |
-| `-s` | `--setup-only` | A syscall allowed only during the setup timer period. |
+| `-s` | `--setup-only` | Specifies a syscall allowed only during the setup timer period. |
 | | `--runtime-time` | Execution timeout (in seconds) for the sandboxed process. |
 
 ---
